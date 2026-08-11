@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -148,6 +149,51 @@ class CollectorTests(unittest.TestCase):
             # The 80 ticks belong to a child which was never present in either
             # process-table scan, but the shell's waited-child counter retains it.
             self.assertAlmostEqual(sample.pane(100).cpu_cores, 0.4)
+
+    def test_reaped_child_cpu_is_not_counted_twice(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            linux_tree(root)
+            clock = [1_000_000_000]
+            collector = LinuxCollector(
+                root,
+                monotonic_ns=lambda: clock[0],
+                process_interval=2.0,
+            )
+            collector._ticks_per_second = 100
+            collector.sample(pss_roots=(100,))
+
+            clock[0] += 2_000_000_000
+            process(
+                root,
+                101,
+                "worker",
+                ppid=100,
+                ticks=100,
+                start=11,
+                rss_kib=1024,
+            )
+            live = collector.sample(pss_roots=(100,))
+            self.assertAlmostEqual(live.pane(100).cpu_cores, 0.25)
+
+            clock[0] += 2_000_000_000
+            shutil.rmtree(root / "proc" / "101")
+            process(
+                root,
+                100,
+                "shell",
+                ppid=1,
+                ticks=100,
+                child_ticks=120,
+                start=10,
+                rss_kib=2048,
+                pss_kib=1500,
+            )
+            reaped = collector.sample(pss_roots=(100,))
+
+            # The first 100 child ticks were already present in the live tree;
+            # only the final 20 ticks are new when they move to shell cutime.
+            self.assertAlmostEqual(reaped.pane(100).cpu_cores, 0.1)
 
 
 if __name__ == "__main__":
