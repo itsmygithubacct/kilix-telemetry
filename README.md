@@ -21,12 +21,17 @@ Each schema-1 snapshot contains:
   and critical hints, plus hwmon fan tachometers;
 - one process table with PID, parent PID, start ticks, CPU ticks, CPU use in
   logical cores, RSS, optional `smaps_rollup` PSS, identity, state, threads,
-  bounded argv, and the memory fields used by the process dashboard.
+  bounded argv, and the memory fields used by the process dashboard. The
+  `processes_total` and `processes_truncated` fields make any ring compaction
+  explicit to process-list consumers.
 
 `Snapshot.pane(root_pid)` follows the shared parent table and aggregates that
 root plus its descendants. Its CPU result is in **cores**, not system load:
 `1.0` means the pane's processes consumed one complete logical CPU during the
-last interval. The retained start tick protects comparisons from PID reuse.
+last interval. Linux's waited-child counters retain CPU used by short commands
+which start and exit between process-table scans; a cumulative tree counter
+accounts for that work without counting it again when a live child is reaped.
+The retained start tick protects comparisons from PID reuse.
 Pane proportional memory sums PSS where the current user can read it and falls
 back to RSS for unavailable processes. Chrome instances publish their live root
 PIDs to a bounded, locked registry, so the sampler opens `smaps_rollup` only for
@@ -43,8 +48,12 @@ The ring is bounded (32 × 512 KiB by default), zlib-compresses JSON records,
 and carries CRC, sequence, schema, wall-clock, monotonic, and writer heartbeat
 metadata. One writer holds an exclusive singleton lock. Readers take a short
 shared file lock while copying a slot, validate both sequence fields and CRC,
-and reject stale data. A dead daemon therefore produces a direct-reader
-fallback, never a frozen green status indicator.
+and reject stale data. Status and lazy startup inspect the live singleton lock,
+not merely the age of the last record, so a dead daemon cannot leave a false
+running result. If a process table would exceed a ring slot, argv is bounded
+further and lower-priority process detail is trimmed while global and pane
+aggregates remain intact; an irreducible record is skipped without terminating
+the long-running sampler.
 
 ## Commands
 

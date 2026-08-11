@@ -16,6 +16,8 @@ from .ring import (
     DEFAULT_SLOT_SIZE,
     RingReader,
     RingUnavailable,
+    TelemetryError,
+    daemon_running,
     resolve_paths,
 )
 
@@ -148,13 +150,20 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if command == "status":
         try:
+            running = daemon_running(paths)
+        except (OSError, TelemetryError):
+            running = False
+        try:
             with RingReader(paths) as reader:
                 sample = reader.latest(max_age=5.0)
-        except (OSError, RingUnavailable):
+        except (OSError, TelemetryError):
             sample = None
-        if sample is None:
+        if not running:
             print(f"stopped  ring={paths.ring}")
             return 1
+        if sample is None:
+            print(f"running  sequence=0 processes=0 ring={paths.ring}")
+            return 0
         print(
             f"running  sequence={sample.sequence} "
             f"processes={len(sample.processes)} ring={paths.ring}"

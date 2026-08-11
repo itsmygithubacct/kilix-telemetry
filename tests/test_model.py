@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from kilix_telemetry.model import (
+    PaneMetrics,
     ProcessMetrics,
     Snapshot,
     SystemMetrics,
@@ -88,6 +89,26 @@ class ModelTests(unittest.TestCase):
         value["schema"] = 99
         with self.assertRaises(ValueError):
             Snapshot.from_dict(value)
+
+    def test_precomputed_pane_metrics_survive_a_compacted_process_table(self) -> None:
+        expected = PaneMetrics(10, 7, 2.5, 800, 600, True)
+        sample = Snapshot(
+            1,
+            2,
+            3,
+            4,
+            "boot",
+            system(),
+            (),
+            (),
+            panes=(expected,),
+            processes_total=100,
+            processes_truncated=True,
+        )
+        decoded = Snapshot.from_dict(sample.to_dict())
+        self.assertEqual(decoded.pane(10), expected)
+        self.assertEqual(decoded.processes_total, 100)
+        self.assertTrue(decoded.processes_truncated)
 
 
 if __name__ == "__main__":

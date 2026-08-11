@@ -118,6 +118,37 @@ class CollectorTests(unittest.TestCase):
             # 200 ticks over the two seconds since the preceding process scan.
             self.assertAlmostEqual(refreshed.pane(100).cpu_cores, 1.0)
 
+    def test_pane_cpu_includes_children_that_exit_between_scans(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            linux_tree(root)
+            clock = [1_000_000_000]
+            collector = LinuxCollector(
+                root,
+                monotonic_ns=lambda: clock[0],
+                process_interval=2.0,
+            )
+            collector._ticks_per_second = 100
+            collector.sample(pss_roots=(100,))
+
+            clock[0] += 2_000_000_000
+            process(
+                root,
+                100,
+                "shell",
+                ppid=1,
+                ticks=100,
+                child_ticks=80,
+                start=10,
+                rss_kib=2048,
+                pss_kib=1500,
+            )
+            sample = collector.sample(pss_roots=(100,))
+
+            # The 80 ticks belong to a child which was never present in either
+            # process-table scan, but the shell's waited-child counter retains it.
+            self.assertAlmostEqual(sample.pane(100).cpu_cores, 0.4)
+
 
 if __name__ == "__main__":
     unittest.main()

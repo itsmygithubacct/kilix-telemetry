@@ -232,6 +232,17 @@ class PaneMetrics:
     proportional_bytes: int
     complete_pss: bool
 
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> PaneMetrics:
+        return cls(
+            root_pid=_nonnegative_int(value.get("root_pid")),
+            process_count=_nonnegative_int(value.get("process_count")),
+            cpu_cores=max(0.0, _finite_float(value.get("cpu_cores"))),
+            rss_bytes=_nonnegative_int(value.get("rss_bytes")),
+            proportional_bytes=_nonnegative_int(value.get("proportional_bytes")),
+            complete_pss=value.get("complete_pss") is True,
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class Snapshot:
@@ -245,6 +256,9 @@ class Snapshot:
     processes: tuple[ProcessMetrics, ...]
     fans: tuple[FanSensor, ...] = ()
     schema: int = SCHEMA_VERSION
+    panes: tuple[PaneMetrics, ...] = ()
+    processes_total: int = 0
+    processes_truncated: bool = False
 
     @property
     def hottest_celsius(self) -> float | None:
@@ -259,6 +273,9 @@ class Snapshot:
         identities when comparing snapshots.
         """
         root_pid = _nonnegative_int(root_pid)
+        for pane in self.panes:
+            if pane.root_pid == root_pid:
+                return pane
         by_pid = {process.pid: process for process in self.processes}
         if root_pid <= 0 or root_pid not in by_pid:
             return PaneMetrics(root_pid, 0, 0.0, 0, 0, False)
@@ -309,12 +326,19 @@ class Snapshot:
         raw_thermal = value.get("thermal", ())
         raw_processes = value.get("processes", ())
         raw_fans = value.get("fans", ())
+        raw_panes = value.get("panes", ())
         if (
             not isinstance(raw_thermal, (list, tuple))
             or not isinstance(raw_processes, (list, tuple))
             or not isinstance(raw_fans, (list, tuple))
+            or not isinstance(raw_panes, (list, tuple))
         ):
             raise TypeError("telemetry snapshot arrays are malformed")
+        processes = tuple(
+            ProcessMetrics.from_dict(item)
+            for item in raw_processes
+            if isinstance(item, Mapping)
+        )
         return cls(
             sequence=_nonnegative_int(value.get("sequence")),
             wall_time_ns=_nonnegative_int(value.get("wall_time_ns")),
@@ -327,15 +351,20 @@ class Snapshot:
                 for item in raw_thermal
                 if isinstance(item, Mapping)
             ),
-            processes=tuple(
-                ProcessMetrics.from_dict(item)
-                for item in raw_processes
-                if isinstance(item, Mapping)
-            ),
+            processes=processes,
             fans=tuple(
                 FanSensor.from_dict(item)
                 for item in raw_fans
                 if isinstance(item, Mapping)
             ),
+            panes=tuple(
+                PaneMetrics.from_dict(item)
+                for item in raw_panes
+                if isinstance(item, Mapping)
+            ),
+            processes_total=max(
+                len(processes), _nonnegative_int(value.get("processes_total"))
+            ),
+            processes_truncated=value.get("processes_truncated") is True,
             schema=schema,
         )

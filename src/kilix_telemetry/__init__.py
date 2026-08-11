@@ -11,10 +11,10 @@ from .model import (
     ThermalSensor,
 )
 from .registry import PaneRegistry
-from .ring import RingReader, RingWriter, TelemetryPaths, resolve_paths
+from .ring import RingReader, RingWriter, TelemetryPaths, daemon_running, resolve_paths
 
-__version__ = "0.1.1"
-TELEMETRY_API_VERSION = (1, 1)
+__version__ = "0.1.2"
+TELEMETRY_API_VERSION = (1, 2)
 
 __all__ = [
     "TELEMETRY_API_VERSION",
@@ -31,6 +31,7 @@ __all__ = [
     "TelemetryPaths",
     "ThermalSensor",
     "__version__",
+    "daemon_running",
     "ensure_running",
     "resolve_paths",
 ]

@@ -16,6 +16,7 @@ from .ring import (
     DaemonLock,
     RingBusy,
     RingWriter,
+    TelemetryError,
     TelemetryPaths,
     resolve_paths,
 )
@@ -60,11 +61,16 @@ def run_daemon(
             first = True
             while not stopping:
                 snapshot = collector.sample(pss_roots=registry.roots())
-                ring.publish(snapshot)
-                if first:
-                    first = False
-                    if ready is not None:
-                        ready()
+                try:
+                    ring.publish(snapshot)
+                except TelemetryError:
+                    if once:
+                        return 1
+                else:
+                    if first:
+                        first = False
+                        if ready is not None:
+                            ready()
                 if once:
                     break
                 deadline += interval

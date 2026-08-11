@@ -11,7 +11,7 @@ import stat
 import struct
 import time
 import zlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Self
 
@@ -165,6 +165,26 @@ class DaemonLock:
         self.close()
 
 
+def daemon_running(paths: TelemetryPaths | None = None) -> bool:
+    """Return whether a process currently owns the singleton writer lock."""
+    paths = paths or resolve_paths()
+    try:
+        fd = _secure_open(paths.lock, os.O_RDWR)
+    except FileNotFoundError:
+        return False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if error.errno in (errno.EACCES, errno.EAGAIN):
+                return True
+            raise
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
 class RingWriter:
     def __init__(
         self,
@@ -199,8 +219,8 @@ class RingWriter:
             max(0, int(heartbeat)),
         )
 
-    def publish(self, snapshot: Snapshot) -> None:
-        sequence = max(1, int(snapshot.sequence))
+    @staticmethod
+    def _encode(snapshot: Snapshot) -> tuple[bytes, int, int]:
         raw = json.dumps(
             snapshot.to_dict(),
             ensure_ascii=False,
@@ -212,12 +232,82 @@ class RingWriter:
             payload, flags = compressed, FLAG_ZLIB
         else:
             payload, flags = raw, 0
-        capacity = self.slot_size - SLOT_HEADER_SIZE
-        if len(payload) > capacity:
-            raise TelemetryError(
-                f"telemetry snapshot requires {len(payload)} bytes; "
-                f"ring slot capacity is {capacity}"
+        return payload, flags, len(raw)
+
+    @staticmethod
+    def _pane_process_ids(snapshot: Snapshot) -> set[int]:
+        roots = {pane.root_pid for pane in snapshot.panes if pane.root_pid > 0}
+        children: dict[int, list[int]] = {}
+        by_pid = {process.pid: process for process in snapshot.processes}
+        for process in snapshot.processes:
+            children.setdefault(process.ppid, []).append(process.pid)
+        selected: set[int] = set()
+        pending = list(roots)
+        while pending:
+            pid = pending.pop()
+            if pid in selected or pid not in by_pid:
+                continue
+            selected.add(pid)
+            pending.extend(children.get(pid, ()))
+        return selected
+
+    def _fit(self, snapshot: Snapshot, capacity: int) -> tuple[bytes, int, int]:
+        encoded = self._encode(snapshot)
+        if len(encoded[0]) <= capacity:
+            return encoded
+
+        total = max(len(snapshot.processes), snapshot.processes_total)
+        compact_processes = tuple(
+            replace(process, command=process.command[:512])
+            for process in snapshot.processes
+        )
+        compact = replace(
+            snapshot,
+            processes=compact_processes,
+            processes_total=total,
+            processes_truncated=True,
+        )
+        encoded = self._encode(compact)
+        if len(encoded[0]) <= capacity:
+            return encoded
+
+        pane_pids = self._pane_process_ids(compact)
+        prioritized = sorted(
+            compact.processes,
+            key=lambda process: (
+                process.pid not in pane_pids,
+                -process.cpu_cores,
+                -process.rss_bytes,
+                process.pid,
+            ),
+        )
+        low = 0
+        high = len(prioritized)
+        best: tuple[bytes, int, int] | None = None
+        while low <= high:
+            count = (low + high) // 2
+            candidate = replace(
+                compact,
+                processes=tuple(
+                    sorted(prioritized[:count], key=lambda process: process.pid)
+                ),
             )
+            candidate_encoded = self._encode(candidate)
+            if len(candidate_encoded[0]) <= capacity:
+                best = candidate_encoded
+                low = count + 1
+            else:
+                high = count - 1
+        if best is None:
+            raise TelemetryError(
+                "telemetry snapshot metadata exceeds the ring slot capacity"
+            )
+        return best
+
+    def publish(self, snapshot: Snapshot) -> None:
+        sequence = max(1, int(snapshot.sequence))
+        capacity = self.slot_size - SLOT_HEADER_SIZE
+        payload, flags, raw_size = self._fit(snapshot, capacity)
         checksum = zlib.crc32(payload) & 0xFFFFFFFF
         offset = HEADER_SIZE + ((sequence - 1) % self.slot_count) * self.slot_size
         fcntl.flock(self.fd, fcntl.LOCK_EX)
@@ -233,7 +323,7 @@ class RingWriter:
                 snapshot.wall_time_ns,
                 flags,
                 len(payload),
-                len(raw),
+                raw_size,
                 checksum,
                 sequence,
             )

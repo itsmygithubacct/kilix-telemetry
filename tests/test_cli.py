@@ -7,6 +7,7 @@ from pathlib import Path
 from helpers import linux_tree
 
 from kilix_telemetry.cli import main
+from kilix_telemetry.ring import DaemonLock, resolve_paths
 
 
 class CliTests(unittest.TestCase):
@@ -31,7 +32,9 @@ class CliTests(unittest.TestCase):
                 ),
                 0,
             )
-            self.assertEqual(main(["status", "--runtime", str(runtime)]), 0)
+            self.assertEqual(main(["status", "--runtime", str(runtime)]), 1)
+            with DaemonLock(resolve_paths(runtime)):
+                self.assertEqual(main(["status", "--runtime", str(runtime)]), 0)
 
 
 if __name__ == "__main__":

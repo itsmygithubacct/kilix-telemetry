@@ -10,7 +10,14 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from .model import FanSensor, ProcessMetrics, Snapshot, SystemMetrics, ThermalSensor
+from .model import (
+    FanSensor,
+    PaneMetrics,
+    ProcessMetrics,
+    Snapshot,
+    SystemMetrics,
+    ThermalSensor,
+)
 
 KIB = 1024
 _NATURAL_PART = re.compile(r"(\d+)")
@@ -124,6 +131,7 @@ class _RawProcess:
     ppid: int
     start_ticks: int
     cpu_ticks: int
+    child_cpu_ticks: int
     rss_bytes: int
     virtual_bytes: int
     uid: int
@@ -156,6 +164,7 @@ def _parse_stat(
         int,
         int,
         int,
+        int,
         str,
         str,
         int,
@@ -174,6 +183,7 @@ def _parse_stat(
             max(0, int(fields[1])),
             max(0, int(fields[19])),
             max(0, int(fields[11]) + int(fields[12])),
+            max(0, int(fields[13]) + int(fields[14])),
             max(0, int(fields[21])) * page_size,
             max(0, int(fields[20])),
             _safe_text(text[left + 1 : right], 80) or str(pid),
@@ -219,6 +229,8 @@ class LinuxCollector:
         self._process_sample_ns: int | None = None
         self._process_pss_roots: tuple[int, ...] = ()
         self._process_cache: tuple[ProcessMetrics, ...] = ()
+        self._pane_cache: tuple[PaneMetrics, ...] = ()
+        self._previous_pane_ticks: dict[tuple[int, int], int] = {}
         self._thermal_interval_ns = max(
             100_000_000, int(thermal_interval * 1_000_000_000)
         )
@@ -248,7 +260,17 @@ class LinuxCollector:
         stat = _parse_stat(pid, _read_text(directory / "stat", 8192), self._page_size)
         if stat is None:
             return None
-        ppid, start_ticks, cpu_ticks, rss, virtual, name, state, threads = stat
+        (
+            ppid,
+            start_ticks,
+            cpu_ticks,
+            child_cpu_ticks,
+            rss,
+            virtual,
+            name,
+            state,
+            threads,
+        ) = stat
         identity = (pid, start_ticks)
         meta = self._metadata_cache.get(identity)
         if meta is None or now_ns - meta.refreshed_ns >= self._metadata_interval_ns:
@@ -279,6 +301,7 @@ class LinuxCollector:
             ppid=ppid,
             start_ticks=start_ticks,
             cpu_ticks=cpu_ticks,
+            child_cpu_ticks=child_cpu_ticks,
             rss_bytes=rss,
             virtual_bytes=virtual,
             uid=meta.uid,
@@ -317,14 +340,14 @@ class LinuxCollector:
         self,
         now_ns: int,
         pss_roots: tuple[int, ...],
-    ) -> tuple[ProcessMetrics, ...]:
+    ) -> tuple[tuple[ProcessMetrics, ...], tuple[PaneMetrics, ...]]:
         pss_roots = tuple(sorted({pid for pid in pss_roots if pid > 0}))
         if (
             self._process_sample_ns is not None
             and now_ns - self._process_sample_ns < self._process_interval_ns
             and pss_roots == self._process_pss_roots
         ):
-            return self._process_cache
+            return self._process_cache, self._pane_cache
         try:
             directories = sorted(
                 (entry for entry in self.proc.iterdir() if entry.name.isdigit()),
@@ -350,14 +373,19 @@ class LinuxCollector:
         by_pid = {process.pid: process for process in raw}
         for process in raw:
             children.setdefault(process.ppid, []).append(process.pid)
+        trees: dict[int, tuple[int, ...]] = {}
         pss_pids: set[int] = set()
-        pending = [pid for pid in pss_roots if pid > 0]
-        while pending:
-            pid = pending.pop()
-            if pid in pss_pids or pid not in by_pid:
-                continue
-            pss_pids.add(pid)
-            pending.extend(children.get(pid, ()))
+        for root_pid in pss_roots:
+            selected: set[int] = set()
+            pending = [root_pid]
+            while pending:
+                pid = pending.pop()
+                if pid in selected or pid not in by_pid:
+                    continue
+                selected.add(pid)
+                pending.extend(children.get(pid, ()))
+            trees[root_pid] = tuple(sorted(selected))
+            pss_pids.update(selected)
         result: list[ProcessMetrics] = []
         for process in raw:
             previous = self._previous_processes.get(process.pid)
@@ -392,7 +420,43 @@ class LinuxCollector:
                     shared_bytes=process.shared_bytes,
                 )
             )
+        metrics_by_pid = {process.pid: process for process in result}
+        pane_result: list[PaneMetrics] = []
+        current_pane_ticks: dict[tuple[int, int], int] = {}
+        for root_pid in pss_roots:
+            selected_raw = [by_pid[pid] for pid in trees[root_pid]]
+            selected_metrics = [metrics_by_pid[pid] for pid in trees[root_pid]]
+            root = by_pid.get(root_pid)
+            cpu_cores = 0.0
+            if root is not None:
+                identity = (root.pid, root.start_ticks)
+                tree_ticks = sum(
+                    process.cpu_ticks + process.child_cpu_ticks
+                    for process in selected_raw
+                )
+                previous_ticks = self._previous_pane_ticks.get(identity)
+                if previous_ticks is not None and denominator > 0.0:
+                    cpu_cores = max(0, tree_ticks - previous_ticks) / denominator
+                current_pane_ticks[identity] = tree_ticks
+            pss_values = [process.pss_bytes for process in selected_metrics]
+            pane_result.append(
+                PaneMetrics(
+                    root_pid=root_pid,
+                    process_count=len(selected_metrics),
+                    cpu_cores=cpu_cores,
+                    rss_bytes=sum(process.rss_bytes for process in selected_metrics),
+                    proportional_bytes=sum(
+                        process.rss_bytes
+                        if process.pss_bytes is None
+                        else process.pss_bytes
+                        for process in selected_metrics
+                    ),
+                    complete_pss=bool(selected_metrics)
+                    and all(value is not None for value in pss_values),
+                )
+            )
         self._previous_processes = current
+        self._previous_pane_ticks = current_pane_ticks
         live = {(process.pid, process.start_ticks) for process in raw}
         self._pss_cache = {
             identity: cached
@@ -408,7 +472,8 @@ class LinuxCollector:
         self._previous_process_when_ns = now_ns
         self._process_pss_roots = pss_roots
         self._process_cache = tuple(result)
-        return self._process_cache
+        self._pane_cache = tuple(pane_result)
+        return self._process_cache, self._pane_cache
 
     @staticmethod
     def _cpu_percent(
@@ -689,7 +754,7 @@ class LinuxCollector:
         cpu_percent, logical_cpus, per_cpu_percent = self._cpu()
         loads = self._loads()
         memory = self._meminfo()
-        processes = self._processes(now_ns, pss_roots)
+        processes, panes = self._processes(now_ns, pss_roots)
         thermal = self._thermal(now_ns)
         snapshot = Snapshot(
             sequence=self._sequence,
@@ -732,6 +797,8 @@ class LinuxCollector:
             thermal=thermal,
             processes=processes,
             fans=self._fan_cache,
+            panes=panes,
+            processes_total=len(processes),
         )
         self._previous_when_ns = now_ns
         return snapshot

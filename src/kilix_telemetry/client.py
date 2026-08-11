@@ -13,7 +13,14 @@ from pathlib import Path
 from .collect import LinuxCollector
 from .model import PaneMetrics, Snapshot
 from .registry import PaneRegistry
-from .ring import RingReader, RingUnavailable, TelemetryPaths, resolve_paths
+from .ring import (
+    RingReader,
+    RingUnavailable,
+    TelemetryError,
+    TelemetryPaths,
+    daemon_running,
+    resolve_paths,
+)
 
 _TRUTHY = {"1", "true", "yes", "on"}
 
@@ -48,6 +55,13 @@ def _ring_snapshot(paths: TelemetryPaths, max_age: float) -> Snapshot | None:
         return None
 
 
+def _writer_active(paths: TelemetryPaths) -> bool:
+    try:
+        return daemon_running(paths)
+    except (OSError, TelemetryError):
+        return False
+
+
 def ensure_running(
     paths: TelemetryPaths | None = None,
     *,
@@ -57,13 +71,14 @@ def ensure_running(
     if _disabled():
         return False
     paths = paths or resolve_paths()
-    if _ring_snapshot(paths, 3.0) is not None:
+    if _writer_active(paths):
         return True
     command = _daemon_command()
     if not command:
         return False
     debug = os.environ.get("KILIX_TELEMETRY_DEBUG", "").lower() in _TRUTHY
     destination = None if debug else subprocess.DEVNULL
+    started_ns = time.monotonic_ns()
     try:
         subprocess.Popen(
             command,
@@ -78,10 +93,15 @@ def ensure_running(
         return False
     deadline = time.monotonic() + max(0.0, timeout)
     while time.monotonic() < deadline:
-        if _ring_snapshot(paths, 3.0) is not None:
+        sample = _ring_snapshot(paths, 3.0)
+        if (
+            _writer_active(paths)
+            and sample is not None
+            and sample.monotonic_ns >= started_ns
+        ):
             return True
         time.sleep(0.05)
-    return _ring_snapshot(paths, 3.0) is not None
+    return _writer_active(paths)
 
 
 class TelemetryClient:
@@ -116,8 +136,11 @@ class TelemetryClient:
             if not force and self._cached is not None and now < self._cached_until:
                 return self._cached
             snapshot = _ring_snapshot(self.paths, self.max_age)
-            if snapshot is None and start and ensure_running(self.paths):
-                snapshot = _ring_snapshot(self.paths, self.max_age)
+            if start and not _writer_active(self.paths):
+                if ensure_running(self.paths):
+                    refreshed = _ring_snapshot(self.paths, self.max_age)
+                    if refreshed is not None:
+                        snapshot = refreshed
             if snapshot is None and fallback:
                 snapshot = self._fallback.sample()
             self._cached = snapshot

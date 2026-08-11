@@ -16,6 +16,7 @@ def process_stat(
     *,
     ppid: int,
     ticks: int,
+    child_ticks: int,
     start: int,
     rss_pages: int,
 ) -> str:
@@ -24,6 +25,7 @@ def process_stat(
     fields[1] = str(ppid)
     fields[11] = str(ticks)
     fields[12] = "0"
+    fields[13] = str(child_ticks)
     fields[17] = "1"
     fields[19] = str(start)
     fields[20] = str(rss_pages * 4096 * 4)
@@ -38,6 +40,7 @@ def process(
     *,
     ppid: int,
     ticks: int,
+    child_ticks: int = 0,
     start: int,
     rss_kib: int,
     pss_kib: int | None = None,
@@ -46,7 +49,15 @@ def process(
     write(
         root,
         f"proc/{pid}/stat",
-        process_stat(pid, name, ppid=ppid, ticks=ticks, start=start, rss_pages=pages),
+        process_stat(
+            pid,
+            name,
+            ppid=ppid,
+            ticks=ticks,
+            child_ticks=child_ticks,
+            start=start,
+            rss_pages=pages,
+        ),
     )
     write(
         root,
