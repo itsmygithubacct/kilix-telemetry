@@ -29,7 +29,14 @@ class CollectorTests(unittest.TestCase):
             self.assertEqual(first.system.memory_total, 8192 * 1024)
             self.assertEqual(first.system.pressure["memory"]["some_avg10"], 2.0)
             self.assertEqual(first.system.vm["pgmajfault"], 3)
+            self.assertEqual(first.system.per_cpu_percent, (None, None))
+            self.assertEqual(first.system.cpu_frequency_mhz, (2400.0, 2500.0))
+            self.assertEqual(first.system.memory_huge_total, 8)
+            self.assertEqual(first.system.memory_huge_free, 3)
+            self.assertEqual(first.system.memory_huge_page_size, 2048 * 1024)
             self.assertEqual(first.hottest_celsius, 72.0)
+            self.assertEqual(first.fans[0].rpm, 3210)
+            self.assertEqual(first.fans[0].label, "Controller")
             self.assertEqual(first.pane(100).cpu_cores, 0.0)
             self.assertEqual(first.pane(100).proportional_bytes, 2200 * 1024)
 
@@ -67,6 +74,7 @@ class CollectorTests(unittest.TestCase):
             second = collector.sample(pss_roots=(100,))
             self.assertAlmostEqual(second.pane(100).cpu_cores, 0.75)
             self.assertAlmostEqual(second.system.cpu_percent or 0.0, 20.0)
+            self.assertEqual(second.system.per_cpu_percent, (20.0, 20.0))
             self.assertEqual(second.interval_ns, 2_000_000_000)
             self.assertEqual(second.pane(200).process_count, 1)
 

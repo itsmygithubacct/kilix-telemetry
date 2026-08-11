@@ -55,6 +55,25 @@ class ThermalSensor:
 
 
 @dataclass(frozen=True, slots=True)
+class FanSensor:
+    key: str
+    chip: str
+    label: str
+    source: str
+    rpm: int
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> FanSensor:
+        return cls(
+            key=str(value.get("key", ""))[:256],
+            chip=str(value.get("chip", ""))[:80],
+            label=str(value.get("label", ""))[:80],
+            source=str(value.get("source", ""))[:80],
+            rpm=min(200_000, _nonnegative_int(value.get("rpm"))),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class ProcessMetrics:
     pid: int
     ppid: int
@@ -123,6 +142,11 @@ class SystemMetrics:
     swap_free: int
     pressure: Mapping[str, Mapping[str, float]] = field(default_factory=dict)
     vm: Mapping[str, int] = field(default_factory=dict)
+    per_cpu_percent: tuple[float | None, ...] = ()
+    cpu_frequency_mhz: tuple[float | None, ...] = ()
+    memory_huge_total: int = 0
+    memory_huge_free: int = 0
+    memory_huge_page_size: int = 0
 
     @property
     def memory_used(self) -> int:
@@ -149,6 +173,20 @@ class SystemMetrics:
         raw_vm = value.get("vm", {})
         if isinstance(raw_vm, Mapping):
             vm = {str(key): _nonnegative_int(number) for key, number in raw_vm.items()}
+
+        def optional_floats(name: str) -> tuple[float | None, ...]:
+            raw = value.get(name, ())
+            if not isinstance(raw, (list, tuple)):
+                return ()
+            result: list[float | None] = []
+            for item in raw[:4096]:
+                if item is None:
+                    result.append(None)
+                    continue
+                parsed = _finite_float(item, -1.0)
+                result.append(parsed if parsed >= 0.0 else None)
+            return tuple(result)
+
         return cls(
             cpu_percent=None
             if cpu is None
@@ -177,6 +215,11 @@ class SystemMetrics:
             swap_free=_nonnegative_int(value.get("swap_free")),
             pressure=pressure,
             vm=vm,
+            per_cpu_percent=optional_floats("per_cpu_percent"),
+            cpu_frequency_mhz=optional_floats("cpu_frequency_mhz"),
+            memory_huge_total=_nonnegative_int(value.get("memory_huge_total")),
+            memory_huge_free=_nonnegative_int(value.get("memory_huge_free")),
+            memory_huge_page_size=_nonnegative_int(value.get("memory_huge_page_size")),
         )
 
 
@@ -200,6 +243,7 @@ class Snapshot:
     system: SystemMetrics
     thermal: tuple[ThermalSensor, ...]
     processes: tuple[ProcessMetrics, ...]
+    fans: tuple[FanSensor, ...] = ()
     schema: int = SCHEMA_VERSION
 
     @property
@@ -264,8 +308,11 @@ class Snapshot:
             raise TypeError("telemetry snapshot has no system record")
         raw_thermal = value.get("thermal", ())
         raw_processes = value.get("processes", ())
-        if not isinstance(raw_thermal, (list, tuple)) or not isinstance(
-            raw_processes, (list, tuple)
+        raw_fans = value.get("fans", ())
+        if (
+            not isinstance(raw_thermal, (list, tuple))
+            or not isinstance(raw_processes, (list, tuple))
+            or not isinstance(raw_fans, (list, tuple))
         ):
             raise TypeError("telemetry snapshot arrays are malformed")
         return cls(
@@ -283,6 +330,11 @@ class Snapshot:
             processes=tuple(
                 ProcessMetrics.from_dict(item)
                 for item in raw_processes
+                if isinstance(item, Mapping)
+            ),
+            fans=tuple(
+                FanSensor.from_dict(item)
+                for item in raw_fans
                 if isinstance(item, Mapping)
             ),
             schema=schema,

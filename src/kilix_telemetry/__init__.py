@@ -3,6 +3,7 @@
 from .client import TelemetryClient, ensure_running
 from .collect import LinuxCollector
 from .model import (
+    FanSensor,
     PaneMetrics,
     ProcessMetrics,
     Snapshot,
@@ -12,11 +13,12 @@ from .model import (
 from .registry import PaneRegistry
 from .ring import RingReader, RingWriter, TelemetryPaths, resolve_paths
 
-__version__ = "0.1.0"
-TELEMETRY_API_VERSION = (1, 0)
+__version__ = "0.1.1"
+TELEMETRY_API_VERSION = (1, 1)
 
 __all__ = [
     "TELEMETRY_API_VERSION",
+    "FanSensor",
     "LinuxCollector",
     "PaneMetrics",
     "PaneRegistry",

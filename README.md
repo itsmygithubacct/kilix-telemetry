@@ -13,11 +13,12 @@ and invalid as soon as its monotonic timestamp becomes stale.
 
 Each schema-1 snapshot contains:
 
-- global CPU utilization and 1/5/15-minute system load;
+- global and per-logical-CPU utilization, current CPU frequency, and
+  1/5/15-minute system load;
 - logical CPU count, uptime, RAM, swap, Linux CPU/memory/I/O PSI, and the VM
   counters used by Kilix Memory;
 - thermal-zone and hwmon temperatures with stable keys and available warning
-  and critical hints;
+  and critical hints, plus hwmon fan tachometers;
 - one process table with PID, parent PID, start ticks, CPU ticks, CPU use in
   logical cores, RSS, optional `smaps_rollup` PSS, identity, state, threads,
   bounded argv, and the memory fields used by the process dashboard.

@@ -77,6 +77,11 @@ def linux_tree(root: Path) -> None:
         ),
     )
     write(root, "proc/loadavg", "1.25 0.75 0.50 1/100 42\n")
+    write(
+        root,
+        "proc/cpuinfo",
+        "processor : 0\ncpu MHz : 2400.0\n\nprocessor : 1\ncpu MHz : 2500.0\n",
+    )
     write(root, "proc/uptime", "100.0 50.0\n")
     write(
         root,
@@ -88,6 +93,7 @@ def linux_tree(root: Path) -> None:
             "AnonPages: 3072 kB\nSlab: 256 kB\nPageTables: 32 kB\n"
             "KernelStack: 16 kB\nDirty: 8 kB\nWriteback: 4 kB\n"
             "SwapTotal: 2048 kB\nSwapFree: 1024 kB\n"
+            "HugePages_Total: 8\nHugePages_Free: 3\nHugepagesize: 2048 kB\n"
         ),
     )
     write(
@@ -114,6 +120,8 @@ def linux_tree(root: Path) -> None:
     write(root, "sys/class/hwmon/hwmon2/name", "nvme\n")
     write(root, "sys/class/hwmon/hwmon2/temp1_label", "Composite\n")
     write(root, "sys/class/hwmon/hwmon2/temp1_input", "51000\n")
+    write(root, "sys/class/hwmon/hwmon2/fan1_label", "Controller\n")
+    write(root, "sys/class/hwmon/hwmon2/fan1_input", "3210\n")
     process(root, 100, "shell", ppid=1, ticks=100, start=10, rss_kib=2048, pss_kib=1500)
     process(
         root, 101, "worker", ppid=100, ticks=50, start=11, rss_kib=1024, pss_kib=700

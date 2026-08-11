@@ -10,7 +10,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from .model import ProcessMetrics, Snapshot, SystemMetrics, ThermalSensor
+from .model import FanSensor, ProcessMetrics, Snapshot, SystemMetrics, ThermalSensor
 
 KIB = 1024
 _NATURAL_PART = re.compile(r"(\d+)")
@@ -34,9 +34,9 @@ def _natural_key(value: str) -> tuple[object, ...]:
 
 def _safe_text(value: str, limit: int = 80) -> str:
     cleaned = "".join(
-        character if character.isprintable() else "?" for character in value
+        character if character.isprintable() else "?" for character in value.strip()
     )
-    return cleaned.strip()[:limit]
+    return cleaned[:limit]
 
 
 def _read_text(path: Path, limit: int = 1 << 20) -> str:
@@ -206,6 +206,7 @@ class LinuxCollector:
         self._previous_when_ns: int | None = None
         self._previous_process_when_ns: int | None = None
         self._previous_cpu: tuple[int, int] | None = None
+        self._previous_per_cpu: dict[int, tuple[int, int]] = {}
         self._previous_processes: dict[int, tuple[int, int]] = {}
         self._sequence = 0
         self._pss_interval_ns = max(0, int(pss_interval * 1_000_000_000))
@@ -223,6 +224,9 @@ class LinuxCollector:
         )
         self._thermal_sample_ns: int | None = None
         self._thermal_cache: tuple[ThermalSensor, ...] = ()
+        self._fan_cache: tuple[FanSensor, ...] = ()
+        self._frequency_sample_ns: int | None = None
+        self._frequency_cache: tuple[float | None, ...] = ()
         try:
             self._ticks_per_second = max(1, int(os.sysconf("SC_CLK_TCK")))
         except (OSError, ValueError):
@@ -406,16 +410,24 @@ class LinuxCollector:
         self._process_cache = tuple(result)
         return self._process_cache
 
-    def _cpu(self) -> tuple[float | None, int]:
-        total = idle = 0
-        logical = 0
+    @staticmethod
+    def _cpu_percent(
+        current: tuple[int, int], previous: tuple[int, int] | None
+    ) -> float | None:
+        total, idle = current
+        if previous is None or total <= previous[0]:
+            return None
+        total_delta = total - previous[0]
+        idle_delta = max(0, idle - previous[1])
+        percent = 100.0 * max(0, total_delta - idle_delta) / total_delta
+        return max(0.0, min(100.0, percent))
+
+    def _cpu(self) -> tuple[float | None, int, tuple[float | None, ...]]:
+        aggregate = (0, 0)
+        per_cpu: dict[int, tuple[int, int]] = {}
         for line in _read_text(self.proc / "stat").splitlines():
             fields = line.split()
             if not fields or not fields[0].startswith("cpu"):
-                continue
-            if fields[0] != "cpu":
-                if fields[0][3:].isdigit():
-                    logical += 1
                 continue
             try:
                 values = [max(0, int(value)) for value in fields[1:]]
@@ -425,14 +437,70 @@ class LinuxCollector:
                 continue
             total = sum(values)
             idle = values[3] + (values[4] if len(values) > 4 else 0)
-        previous = self._previous_cpu
-        self._previous_cpu = (total, idle)
-        if previous is None or total <= previous[0]:
-            return None, max(1, logical or (os.cpu_count() or 1))
-        total_delta = total - previous[0]
-        idle_delta = max(0, idle - previous[1])
-        percent = 100.0 * max(0, total_delta - idle_delta) / total_delta
-        return max(0.0, min(100.0, percent)), max(1, logical or (os.cpu_count() or 1))
+            if fields[0] == "cpu":
+                aggregate = (total, idle)
+            elif fields[0][3:].isdigit():
+                per_cpu[int(fields[0][3:])] = (total, idle)
+        percent = self._cpu_percent(aggregate, self._previous_cpu)
+        self._previous_cpu = aggregate
+        logical = max(
+            1,
+            (max(per_cpu) + 1) if per_cpu else (os.cpu_count() or 1),
+        )
+        per_percent = tuple(
+            self._cpu_percent(per_cpu[index], self._previous_per_cpu.get(index))
+            if index in per_cpu
+            else None
+            for index in range(logical)
+        )
+        self._previous_per_cpu = per_cpu
+        return percent, logical, per_percent
+
+    def _cpu_frequency(
+        self, now_ns: int, logical_cpus: int
+    ) -> tuple[float | None, ...]:
+        if (
+            self._frequency_sample_ns is not None
+            and now_ns - self._frequency_sample_ns < self._thermal_interval_ns
+            and len(self._frequency_cache) == logical_cpus
+        ):
+            return self._frequency_cache
+        values: list[float | None] = [None] * logical_cpus
+        current_cpu: int | None = None
+        for line in _read_text(self.proc / "cpuinfo", 8 << 20).splitlines():
+            key, separator, raw = line.partition(":")
+            if not separator:
+                continue
+            key = key.strip().lower()
+            if key == "processor":
+                try:
+                    current_cpu = int(raw.strip())
+                except ValueError:
+                    current_cpu = None
+            elif key == "cpu mhz" and current_cpu is not None:
+                mhz = _number(raw)
+                if (
+                    mhz is not None
+                    and 0.0 < mhz < 1_000_000.0
+                    and 0 <= current_cpu < len(values)
+                ):
+                    values[current_cpu] = float(f"{mhz:.3f}")
+        for index, value in enumerate(values):
+            if value is not None:
+                continue
+            khz = _number(
+                _read_text(
+                    self.sys
+                    / "devices/system/cpu"
+                    / f"cpu{index}/cpufreq/scaling_cur_freq",
+                    128,
+                )
+            )
+            if khz is not None and 0.0 < khz < 1_000_000_000.0:
+                values[index] = float(f"{khz / 1000.0:.3f}")
+        self._frequency_sample_ns = now_ns
+        self._frequency_cache = tuple(values)
+        return self._frequency_cache
 
     def _loads(self) -> tuple[float, float, float]:
         fields = _read_text(self.proc / "loadavg", 256).split()
@@ -520,6 +588,7 @@ class LinuxCollector:
         ):
             return self._thermal_cache
         sensors: list[ThermalSensor] = []
+        fans: list[FanSensor] = []
         thermal_root = self.sys / "class/thermal"
         for zone in sorted(
             thermal_root.glob("thermal_zone*"), key=lambda path: _natural_key(path.name)
@@ -584,8 +653,28 @@ class LinuxCollector:
                         ),
                     )
                 )
+            for input_path in sorted(
+                hwmon.glob("fan*_input"), key=lambda path: _natural_key(path.name)
+            ):
+                rpm = _number(_read_text(input_path, 128))
+                if rpm is None or rpm < 0.0 or rpm > 200_000.0:
+                    continue
+                prefix = input_path.name.removesuffix("_input")
+                label = _clean_label(
+                    _read_text(hwmon / f"{prefix}_label", 256) or prefix
+                )
+                fans.append(
+                    FanSensor(
+                        key=f"fan:{hwmon.name}:{raw_chip}:{prefix}",
+                        chip=_pretty_chip(raw_chip),
+                        label=label,
+                        source=hwmon.name,
+                        rpm=round(rpm),
+                    )
+                )
         self._thermal_sample_ns = now_ns
         self._thermal_cache = tuple(sensors)
+        self._fan_cache = tuple(fans)
         return self._thermal_cache
 
     def sample(self, *, pss_roots: tuple[int, ...] = ()) -> Snapshot:
@@ -597,10 +686,11 @@ class LinuxCollector:
             if self._previous_when_ns is None
             else max(0, now_ns - self._previous_when_ns)
         )
-        cpu_percent, logical_cpus = self._cpu()
+        cpu_percent, logical_cpus, per_cpu_percent = self._cpu()
         loads = self._loads()
         memory = self._meminfo()
         processes = self._processes(now_ns, pss_roots)
+        thermal = self._thermal(now_ns)
         snapshot = Snapshot(
             sequence=self._sequence,
             wall_time_ns=wall_ns,
@@ -633,9 +723,15 @@ class LinuxCollector:
                 swap_free=memory.get("SwapFree", 0),
                 pressure=self._pressure(),
                 vm=self._vm(),
+                per_cpu_percent=per_cpu_percent,
+                cpu_frequency_mhz=self._cpu_frequency(now_ns, logical_cpus),
+                memory_huge_total=memory.get("HugePages_Total", 0),
+                memory_huge_free=memory.get("HugePages_Free", 0),
+                memory_huge_page_size=memory.get("Hugepagesize", 0),
             ),
-            thermal=self._thermal(now_ns),
+            thermal=thermal,
             processes=processes,
+            fans=self._fan_cache,
         )
         self._previous_when_ns = now_ns
         return snapshot
