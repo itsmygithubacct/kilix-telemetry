@@ -1,0 +1,22 @@
+[project]
+name = "kilix-telemetry"
+version = "0.1.0"
+description = "Shared Linux telemetry sampler and mmap ring for Kilix"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [
+  { name = "itsmygithubacct", email = "itsmygithubacct@users.noreply.github.com" },
+]
+dependencies = []
+
+[project.scripts]
+kilix-telemetry = "kilix_telemetry.cli:main"
+kilix-telemetryd = "kilix_telemetry.cli:daemon_main"
+
+[build-system]
+requires = ["uv_build>=0.11.26,<0.12"]
+build-backend = "uv_build"
+
+[tool.uv]
+package = true
