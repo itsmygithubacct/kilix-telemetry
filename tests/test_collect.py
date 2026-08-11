@@ -86,6 +86,30 @@ class CollectorTests(unittest.TestCase):
             replacement = next(item for item in sample.processes if item.pid == 101)
             self.assertEqual(replacement.cpu_cores, 0.0)
 
+    def test_cached_process_table_keeps_the_full_cpu_interval(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            linux_tree(root)
+            clock = [1_000_000_000]
+            collector = LinuxCollector(
+                root,
+                monotonic_ns=lambda: clock[0],
+                process_interval=2.0,
+            )
+            collector._ticks_per_second = 100
+            collector.sample()
+
+            clock[0] += 1_000_000_000
+            process(root, 101, "worker", ppid=100, ticks=150, start=11, rss_kib=1024)
+            cached = collector.sample()
+            self.assertEqual(cached.pane(100).cpu_cores, 0.0)
+
+            clock[0] += 1_000_000_000
+            process(root, 101, "worker", ppid=100, ticks=250, start=11, rss_kib=1024)
+            refreshed = collector.sample()
+            # 200 ticks over the two seconds since the preceding process scan.
+            self.assertAlmostEqual(refreshed.pane(100).cpu_cores, 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -36,6 +36,9 @@ def _parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command")
 
     serve = subparsers.add_parser("serve", help="run the single sampler")
+    serve.add_argument(
+        "--runtime", dest="command_runtime", help="private telemetry runtime directory"
+    )
     serve.add_argument("--root", default="/", help="injectable proc/sys root")
     serve.add_argument("--interval", type=float, default=configured_interval())
     serve.add_argument("--pss-interval", type=float, default=configured_pss_interval())
@@ -45,26 +48,39 @@ def _parser() -> argparse.ArgumentParser:
     serve.add_argument("--quiet", action="store_true")
 
     snapshot = subparsers.add_parser("snapshot", help="print the newest sample")
+    snapshot.add_argument(
+        "--runtime", dest="command_runtime", help="private telemetry runtime directory"
+    )
     snapshot.add_argument("--direct", action="store_true")
     snapshot.add_argument("--no-start", action="store_true")
     snapshot.add_argument("--no-processes", action="store_true")
     snapshot.add_argument("--root", default="/")
 
     pane = subparsers.add_parser("pane", help="print one process-tree sample")
+    pane.add_argument(
+        "--runtime", dest="command_runtime", help="private telemetry runtime directory"
+    )
     pane.add_argument("pid", type=int)
     pane.add_argument("--no-start", action="store_true")
 
     history = subparsers.add_parser("history", help="print recent ring samples")
+    history.add_argument(
+        "--runtime", dest="command_runtime", help="private telemetry runtime directory"
+    )
     history.add_argument("--limit", type=int, default=10)
     history.add_argument("--no-processes", action="store_true")
 
-    subparsers.add_parser("status", help="report daemon and ring health")
+    status = subparsers.add_parser("status", help="report daemon and ring health")
+    status.add_argument(
+        "--runtime", dest="command_runtime", help="private telemetry runtime directory"
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
-    paths = resolve_paths(arguments.runtime)
+    runtime = getattr(arguments, "command_runtime", None) or arguments.runtime
+    paths = resolve_paths(runtime)
     command = arguments.command or "status"
     if command == "serve":
         result = run_daemon(

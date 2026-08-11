@@ -65,3 +65,4 @@ Set `KILIX_TELEMETRY_DISABLE=1` to exercise the fallback explicitly.
 
 Runtime dependencies: Python 3.11+ and Linux procfs/sysfs. The project is
 managed and locked with `uv`; it has no third-party runtime packages.
+The schema-1 component is first consumed by the Kilix 0.1.9 release.
