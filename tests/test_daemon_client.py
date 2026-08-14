@@ -9,6 +9,7 @@ from helpers import linux_tree
 
 from kilix_telemetry.client import TelemetryClient, ensure_running
 from kilix_telemetry.daemon import run_daemon
+from kilix_telemetry.registry import PaneRegistry
 from kilix_telemetry.ring import TelemetryError, resolve_paths
 
 
@@ -63,6 +64,53 @@ class DaemonClientTests(unittest.TestCase):
             with mock.patch("kilix_telemetry.client.subprocess.Popen") as spawn:
                 self.assertFalse(ensure_running(paths, timeout=0))
             spawn.assert_called_once()
+
+    def test_pane_polls_accumulate_registered_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = base / "linux"
+            root.mkdir()
+            linux_tree(root)
+            paths = resolve_paths(base / "runtime")
+            client = TelemetryClient(paths, fallback_root=root)
+            client.pane(100, start=False)
+            client.pane(200, start=False, force=True)
+            self.assertEqual(PaneRegistry(paths).roots(), (100, 200))
+
+    def test_unchanged_pane_set_throttles_registry_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = base / "linux"
+            root.mkdir()
+            linux_tree(root)
+            paths = resolve_paths(base / "runtime")
+            client = TelemetryClient(paths, fallback_root=root)
+            real_update = PaneRegistry.update
+            with mock.patch.object(
+                PaneRegistry, "update", autospec=True, side_effect=real_update
+            ) as update:
+                client.pane(100, start=False)
+                client.pane(100, start=False, force=True)
+                client.pane(100, start=False, force=True)
+            self.assertEqual(update.call_count, 1)
+            self.assertEqual(PaneRegistry(paths).roots(), (100,))
+
+    def test_stale_pane_roots_age_out_of_registration(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = base / "linux"
+            root.mkdir()
+            linux_tree(root)
+            paths = resolve_paths(base / "runtime")
+            client = TelemetryClient(paths, fallback_root=root)
+            clock = [100.0]
+            with mock.patch(
+                "kilix_telemetry.client.time.monotonic", side_effect=lambda: clock[0]
+            ):
+                client.pane(100, start=False)
+                clock[0] += 20.0
+                client.pane(200, start=False, force=True)
+            self.assertEqual(PaneRegistry(paths).roots(), (200,))
 
     def test_daemon_handles_an_unpublishable_once_sample(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

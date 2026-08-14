@@ -12,7 +12,7 @@ from pathlib import Path
 
 from .collect import LinuxCollector
 from .model import PaneMetrics, Snapshot
-from .registry import PaneRegistry
+from .registry import DEFAULT_STALE_SECONDS, PaneRegistry
 from .ring import (
     RingReader,
     RingUnavailable,
@@ -120,6 +120,9 @@ class TelemetryClient:
         self._cached: Snapshot | None = None
         self._cached_until = 0.0
         self._lock = threading.Lock()
+        self._pane_roots: dict[int, float] = {}
+        self._registered_roots: tuple[int, ...] = ()
+        self._registered_at = 0.0
 
     def snapshot(
         self,
@@ -155,7 +158,7 @@ class TelemetryClient:
         fallback: bool = True,
         force: bool = False,
     ) -> PaneMetrics:
-        self.register_panes((root_pid,))
+        self._register_pane(root_pid)
         snapshot = self.snapshot(start=start, fallback=False, force=force)
         if snapshot is None and fallback:
             snapshot = self._fallback.sample(pss_roots=(int(root_pid),))
@@ -163,13 +166,64 @@ class TelemetryClient:
             return PaneMetrics(max(0, int(root_pid)), 0, 0.0, 0, 0, False)
         return snapshot.pane(root_pid)
 
+    def _register_pane(self, root_pid: int) -> None:
+        """Register the union of every pane this process polls.
+
+        One client polling several panes must keep every root visible to the
+        sampler; registering only the most recent poll would flap the shared
+        registry between singletons, resetting pane CPU deltas and PSS scope.
+        Roots which have not been polled within the registry staleness window
+        age out, and an unchanged set is re-registered only often enough to
+        keep its record fresh.
+        """
+        if _disabled():
+            return
+        try:
+            pid = int(root_pid)
+        except (TypeError, ValueError):
+            return
+        if pid <= 0:
+            return
+        now = time.monotonic()
+        self._pane_roots[pid] = now
+        horizon = now - DEFAULT_STALE_SECONDS
+        for known, seen in list(self._pane_roots.items()):
+            if seen < horizon:
+                del self._pane_roots[known]
+        union = tuple(sorted(self._pane_roots))
+        if (
+            union == self._registered_roots
+            and now - self._registered_at < DEFAULT_STALE_SECONDS / 3.0
+        ):
+            return
+        if self._write_pane_roots(union):
+            self._registered_roots = union
+            self._registered_at = now
+
+    def _write_pane_roots(self, roots: tuple[int, ...]) -> bool:
+        try:
+            PaneRegistry(self.paths).update(os.getpid(), roots)
+        except (OSError, ValueError):
+            return False
+        return True
+
     def register_panes(self, roots: tuple[int, ...] | list[int]) -> bool:
         if _disabled():
             return False
-        try:
-            PaneRegistry(self.paths).update(os.getpid(), tuple(roots))
-        except (OSError, ValueError):
+        if not self._write_pane_roots(tuple(roots)):
             return False
+        now = time.monotonic()
+        accepted: dict[int, float] = {}
+        for item in tuple(roots):
+            try:
+                pid = int(item)
+            except (TypeError, ValueError):
+                continue
+            if pid > 0:
+                accepted[pid] = now
+        self._pane_roots = accepted
+        self._registered_roots = tuple(sorted(accepted))
+        self._registered_at = now
         return True
 
     def history(
