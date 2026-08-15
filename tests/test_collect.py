@@ -79,6 +79,64 @@ class CollectorTests(unittest.TestCase):
             self.assertEqual(second.interval_ns, 2_000_000_000)
             self.assertEqual(second.pane(200).process_count, 1)
 
+    def test_sensor_values_refresh_through_the_cached_topology(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            linux_tree(root)
+            clock = [1_000_000_000]
+            collector = LinuxCollector(root, monotonic_ns=lambda: clock[0])
+            first = collector.sample()
+            self.assertEqual(first.hottest_celsius, 72.0)
+            self.assertEqual(first.fans[0].rpm, 3210)
+
+            write(root, "sys/class/thermal/thermal_zone0/temp", "80000\n")
+            write(root, "sys/class/hwmon/hwmon2/fan1_input", "2500\n")
+            clock[0] += 2_000_000_000
+            second = collector.sample()
+            self.assertEqual(second.hottest_celsius, 80.0)
+            self.assertEqual(second.fans[0].rpm, 2500)
+
+            # A newly appearing sensor waits for the slow topology rescan.
+            write(root, "sys/class/hwmon/hwmon2/temp2_input", "44000\n")
+            clock[0] += 2_000_000_000
+            third = collector.sample()
+            self.assertNotIn(
+                "hwmon:hwmon2:nvme:temp2",
+                [sensor.key for sensor in third.thermal],
+            )
+            clock[0] += 60_000_000_000
+            fourth = collector.sample()
+            self.assertIn(
+                "hwmon:hwmon2:nvme:temp2",
+                [sensor.key for sensor in fourth.thermal],
+            )
+
+    def test_removed_sensor_disappears_and_forces_a_rescan(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            linux_tree(root)
+            clock = [1_000_000_000]
+            collector = LinuxCollector(root, monotonic_ns=lambda: clock[0])
+            collector.sample()
+
+            (root / "sys/class/hwmon/hwmon2/temp1_input").unlink()
+            clock[0] += 2_000_000_000
+            gone = collector.sample()
+            self.assertNotIn(
+                "hwmon:hwmon2:nvme:temp1",
+                [sensor.key for sensor in gone.thermal],
+            )
+
+            # The vanished input forces an early topology refresh, so a
+            # sensor added now appears well before the slow rescan cadence.
+            write(root, "sys/class/hwmon/hwmon2/temp3_input", "40000\n")
+            clock[0] += 2_000_000_000
+            refreshed = collector.sample()
+            self.assertIn(
+                "hwmon:hwmon2:nvme:temp3",
+                [sensor.key for sensor in refreshed.thermal],
+            )
+
     def test_pid_reuse_does_not_inherit_cpu_ticks(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

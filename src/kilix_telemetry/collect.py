@@ -145,6 +145,30 @@ class _RawProcess:
 
 
 @dataclass(frozen=True, slots=True)
+class _TemperatureSource:
+    """Static identity of one temperature input; only its value changes."""
+
+    input_path: Path
+    key: str
+    chip: str
+    label: str
+    source: str
+    warning_celsius: float | None
+    critical_celsius: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class _FanSource:
+    """Static identity of one fan tachometer input."""
+
+    input_path: Path
+    key: str
+    chip: str
+    label: str
+    source: str
+
+
+@dataclass(frozen=True, slots=True)
 class _ProcessMeta:
     refreshed_ns: int
     uid: int
@@ -237,6 +261,11 @@ class LinuxCollector:
         self._thermal_sample_ns: int | None = None
         self._thermal_cache: tuple[ThermalSensor, ...] = ()
         self._fan_cache: tuple[FanSensor, ...] = ()
+        self._sensor_rescan_ns = max(self._thermal_interval_ns, 60_000_000_000)
+        self._sensors_scanned_ns: int | None = None
+        self._rescan_sensors = False
+        self._temperature_sources: tuple[_TemperatureSource, ...] = ()
+        self._fan_sources: tuple[_FanSource, ...] = ()
         self._frequency_sample_ns: int | None = None
         self._frequency_cache: tuple[float | None, ...] = ()
         try:
@@ -646,21 +675,19 @@ class LinuxCollector:
                 continue
         return values
 
-    def _thermal(self, now_ns: int) -> tuple[ThermalSensor, ...]:
-        if (
-            self._thermal_sample_ns is not None
-            and now_ns - self._thermal_sample_ns < self._thermal_interval_ns
-        ):
-            return self._thermal_cache
-        sensors: list[ThermalSensor] = []
-        fans: list[FanSensor] = []
+    def _discover_sensors(self) -> None:
+        """Scan sysfs for sensor topology: paths, names, labels, thresholds.
+
+        Everything gathered here is a hardware constant - only the *_input
+        values change between refreshes - so the result is cached and
+        re-scanned on a slow cadence or when an input file disappears.
+        """
+        temperatures: list[_TemperatureSource] = []
+        fans: list[_FanSource] = []
         thermal_root = self.sys / "class/thermal"
         for zone in sorted(
             thermal_root.glob("thermal_zone*"), key=lambda path: _natural_key(path.name)
         ):
-            celsius = _temperature(zone / "temp")
-            if celsius is None:
-                continue
             zone_type = _safe_text(_read_text(zone / "type", 256)) or zone.name
             warning: float | None = None
             critical: float | None = None
@@ -677,13 +704,13 @@ class LinuxCollector:
                 elif kind in {"hot", "active", "passive"}:
                     warning = value if warning is None else min(warning, value)
             index = zone.name.removeprefix("thermal_zone")
-            sensors.append(
-                ThermalSensor(
+            temperatures.append(
+                _TemperatureSource(
+                    input_path=zone / "temp",
                     key=f"zone:{index}:{zone_type}",
                     chip=_pretty_chip(zone_type),
                     label=f"zone {index}",
                     source="thermal-zone",
-                    celsius=celsius,
                     warning_celsius=warning,
                     critical_celsius=critical,
                 )
@@ -696,20 +723,17 @@ class LinuxCollector:
             for input_path in sorted(
                 hwmon.glob("temp*_input"), key=lambda path: _natural_key(path.name)
             ):
-                celsius = _temperature(input_path)
-                if celsius is None:
-                    continue
                 prefix = input_path.name.removesuffix("_input")
                 label = _clean_label(
                     _read_text(hwmon / f"{prefix}_label", 256) or prefix
                 )
-                sensors.append(
-                    ThermalSensor(
+                temperatures.append(
+                    _TemperatureSource(
+                        input_path=input_path,
                         key=f"hwmon:{hwmon.name}:{raw_chip}:{prefix}",
                         chip=_pretty_chip(raw_chip),
                         label=label,
                         source=hwmon.name,
-                        celsius=celsius,
                         warning_celsius=_temperature(
                             hwmon / f"{prefix}_max", threshold=True
                         ),
@@ -721,22 +745,70 @@ class LinuxCollector:
             for input_path in sorted(
                 hwmon.glob("fan*_input"), key=lambda path: _natural_key(path.name)
             ):
-                rpm = _number(_read_text(input_path, 128))
-                if rpm is None or rpm < 0.0 or rpm > 200_000.0:
-                    continue
                 prefix = input_path.name.removesuffix("_input")
                 label = _clean_label(
                     _read_text(hwmon / f"{prefix}_label", 256) or prefix
                 )
                 fans.append(
-                    FanSensor(
+                    _FanSource(
+                        input_path=input_path,
                         key=f"fan:{hwmon.name}:{raw_chip}:{prefix}",
                         chip=_pretty_chip(raw_chip),
                         label=label,
                         source=hwmon.name,
-                        rpm=round(rpm),
                     )
                 )
+        self._temperature_sources = tuple(temperatures)
+        self._fan_sources = tuple(fans)
+
+    def _thermal(self, now_ns: int) -> tuple[ThermalSensor, ...]:
+        if (
+            self._thermal_sample_ns is not None
+            and now_ns - self._thermal_sample_ns < self._thermal_interval_ns
+        ):
+            return self._thermal_cache
+        if (
+            self._rescan_sensors
+            or self._sensors_scanned_ns is None
+            or now_ns - self._sensors_scanned_ns >= self._sensor_rescan_ns
+        ):
+            self._discover_sensors()
+            self._sensors_scanned_ns = now_ns
+            self._rescan_sensors = False
+        sensors: list[ThermalSensor] = []
+        fans: list[FanSensor] = []
+        for source in self._temperature_sources:
+            celsius = _temperature(source.input_path)
+            if celsius is None:
+                if not source.input_path.exists():
+                    self._rescan_sensors = True
+                continue
+            sensors.append(
+                ThermalSensor(
+                    key=source.key,
+                    chip=source.chip,
+                    label=source.label,
+                    source=source.source,
+                    celsius=celsius,
+                    warning_celsius=source.warning_celsius,
+                    critical_celsius=source.critical_celsius,
+                )
+            )
+        for fan in self._fan_sources:
+            rpm = _number(_read_text(fan.input_path, 128))
+            if rpm is None or rpm < 0.0 or rpm > 200_000.0:
+                if rpm is None and not fan.input_path.exists():
+                    self._rescan_sensors = True
+                continue
+            fans.append(
+                FanSensor(
+                    key=fan.key,
+                    chip=fan.chip,
+                    label=fan.label,
+                    source=fan.source,
+                    rpm=round(rpm),
+                )
+            )
         self._thermal_sample_ns = now_ns
         self._thermal_cache = tuple(sensors)
         self._fan_cache = tuple(fans)
