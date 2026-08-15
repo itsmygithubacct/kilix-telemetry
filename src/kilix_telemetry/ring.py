@@ -434,23 +434,21 @@ class RingReader:
             raise RingUnavailable("telemetry ring size does not match its header")
         return latest, slot_count, slot_size, heartbeat
 
-    def _decode(self, expected: int) -> Snapshot | None:
+    def _copy_slot(self, expected: int) -> tuple[tuple[int, ...], bytes] | None:
+        """Copy one slot header and payload; the caller holds the shared lock.
+
+        Only the cheap consistency checks and the byte copy happen here so the
+        lock, which the writer must take exclusively to publish, is held for
+        as short a window as possible.
+        """
         if expected <= 0:
             return None
         offset = HEADER_SIZE + ((expected - 1) % self.slot_count) * self.slot_size
         try:
-            (
-                sequence,
-                monotonic_ns,
-                wall_time_ns,
-                flags,
-                payload_size,
-                raw_size,
-                checksum,
-                tail_sequence,
-            ) = _SLOT.unpack_from(self.mapping, offset)
+            header = _SLOT.unpack_from(self.mapping, offset)
         except struct.error:
             return None
+        sequence, _, _, flags, payload_size, raw_size, _, tail_sequence = header
         capacity = self.slot_size - SLOT_HEADER_SIZE
         if (
             sequence != expected
@@ -463,7 +461,21 @@ class RingReader:
         ):
             return None
         start = offset + SLOT_HEADER_SIZE
-        payload = bytes(self.mapping[start : start + payload_size])
+        return header, bytes(self.mapping[start : start + payload_size])
+
+    @staticmethod
+    def _parse_slot(header: tuple[int, ...], payload: bytes) -> Snapshot | None:
+        """Validate and decode one copied slot outside any ring lock."""
+        (
+            sequence,
+            monotonic_ns,
+            wall_time_ns,
+            flags,
+            _payload_size,
+            raw_size,
+            checksum,
+            _tail_sequence,
+        ) = header
         if zlib.crc32(payload) & 0xFFFFFFFF != checksum:
             return None
         try:
@@ -477,7 +489,7 @@ class RingReader:
         except (ValueError, TypeError, zlib.error, UnicodeDecodeError):
             return None
         if (
-            snapshot.sequence != expected
+            snapshot.sequence != sequence
             or snapshot.monotonic_ns != monotonic_ns
             or snapshot.wall_time_ns != wall_time_ns
         ):
@@ -488,9 +500,10 @@ class RingReader:
         fcntl.flock(self.fd, fcntl.LOCK_SH)
         try:
             latest, _, _, _ = self._header()
-            snapshot = self._decode(latest)
+            copied = self._copy_slot(latest)
         finally:
             fcntl.flock(self.fd, fcntl.LOCK_UN)
+        snapshot = None if copied is None else self._parse_slot(*copied)
         if snapshot is None or max_age is None:
             return snapshot
         age_ns = time.monotonic_ns() - snapshot.monotonic_ns
@@ -512,13 +525,18 @@ class RingReader:
         fcntl.flock(self.fd, fcntl.LOCK_SH)
         try:
             latest, _, _, _ = self._header()
-            found = [
-                snapshot
+            copies = [
+                copied
                 for expected in range(latest, max(0, latest - requested), -1)
-                if (snapshot := self._decode(expected)) is not None
+                if (copied := self._copy_slot(expected)) is not None
             ]
         finally:
             fcntl.flock(self.fd, fcntl.LOCK_UN)
+        found = [
+            snapshot
+            for copied in copies
+            if (snapshot := self._parse_slot(*copied)) is not None
+        ]
         found.reverse()
         if max_age is not None:
             cutoff = time.monotonic_ns() - int(max_age * 1_000_000_000)

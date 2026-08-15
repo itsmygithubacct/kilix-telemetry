@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import fcntl
 import os
 import random
 import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 from helpers import linux_tree
 
 from kilix_telemetry.collect import LinuxCollector
+from kilix_telemetry.model import Snapshot
 from kilix_telemetry.ring import (
     DaemonLock,
     RingReader,
@@ -47,6 +50,41 @@ class RingTests(unittest.TestCase):
                         [sample.sequence for sample in reader.history()],
                         [3, 4, 5],
                     )
+
+    def test_slots_are_parsed_outside_the_shared_ring_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "linux"
+            runtime = Path(temporary) / "runtime"
+            root.mkdir()
+            linux_tree(root)
+            base = LinuxCollector(root).sample()
+            paths = resolve_paths(runtime)
+            with RingWriter(paths, slot_count=3, slot_size=64 * 1024) as writer:
+                writer.publish(base)
+            unlocked: list[bool] = []
+            real = Snapshot.from_dict.__func__
+
+            def probing(cls: type[Snapshot], value: object) -> Snapshot:
+                # An exclusive lock succeeds only while no reader holds the
+                # shared ring lock, proving decode runs after its release.
+                fd = os.open(paths.ring, os.O_RDWR)
+                try:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except OSError:
+                        unlocked.append(False)
+                    else:
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                        unlocked.append(True)
+                finally:
+                    os.close(fd)
+                return real(cls, value)
+
+            with mock.patch.object(Snapshot, "from_dict", classmethod(probing)):
+                with RingReader(paths) as reader:
+                    self.assertIsNotNone(reader.latest(max_age=None))
+                    self.assertEqual(len(reader.history()), 1)
+            self.assertEqual(unlocked, [True, True])
 
     def test_geometry_change_swaps_the_ring_file_under_live_readers(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
