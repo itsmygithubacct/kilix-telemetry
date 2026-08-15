@@ -47,10 +47,30 @@ def _spawn_environment(paths: TelemetryPaths) -> dict[str, str]:
     return environment
 
 
-def _ring_snapshot(paths: TelemetryPaths, max_age: float) -> Snapshot | None:
+def _fresh_reader(paths: TelemetryPaths, cached: RingReader | None) -> RingReader | None:
+    """Return a reader for the current ring file, reusing a valid mapping.
+
+    Re-mapping the whole ring for every read costs a page-table cycle per
+    poll; a cached mapping stays valid while the path still names the same
+    inode with the same size. A replaced or resized ring (the writer renames
+    a new file over the path on geometry change) is detected by comparing the
+    path against the mapped file, and the stale reader is closed.
+    """
+    if cached is not None:
+        try:
+            named = os.stat(paths.ring)
+            mapped = os.fstat(cached.fd)
+            if (
+                named.st_ino == mapped.st_ino
+                and named.st_dev == mapped.st_dev
+                and named.st_size == cached.size
+            ):
+                return cached
+        except OSError:
+            pass
+        cached.close()
     try:
-        with RingReader(paths) as reader:
-            return reader.latest(max_age=max_age)
+        return RingReader(paths)
     except (OSError, RingUnavailable):
         return None
 
@@ -92,16 +112,28 @@ def ensure_running(
     except OSError:
         return False
     deadline = time.monotonic() + max(0.0, timeout)
-    while time.monotonic() < deadline:
-        sample = _ring_snapshot(paths, 3.0)
-        if (
-            _writer_active(paths)
-            and sample is not None
-            and sample.monotonic_ns >= started_ns
-        ):
-            return True
-        time.sleep(0.05)
-    return _writer_active(paths)
+    reader: RingReader | None = None
+    try:
+        while time.monotonic() < deadline:
+            reader = _fresh_reader(paths, reader)
+            sample = None
+            if reader is not None:
+                try:
+                    sample = reader.latest(max_age=3.0)
+                except (OSError, RingUnavailable):
+                    reader.close()
+                    reader = None
+            if (
+                _writer_active(paths)
+                and sample is not None
+                and sample.monotonic_ns >= started_ns
+            ):
+                return True
+            time.sleep(0.05)
+        return _writer_active(paths)
+    finally:
+        if reader is not None:
+            reader.close()
 
 
 class TelemetryClient:
@@ -120,6 +152,9 @@ class TelemetryClient:
         self._cached: Snapshot | None = None
         self._cached_until = 0.0
         self._lock = threading.Lock()
+        self._reader: RingReader | None = None
+        self._writer_alive = False
+        self._writer_checked = float("-inf")
         self._pane_roots: dict[int, float] = {}
         self._registered_roots: tuple[int, ...] = ()
         self._registered_at = 0.0
@@ -138,10 +173,12 @@ class TelemetryClient:
             now = time.monotonic()
             if not force and self._cached is not None and now < self._cached_until:
                 return self._cached
-            snapshot = _ring_snapshot(self.paths, self.max_age)
-            if start and not _writer_active(self.paths):
+            snapshot = self._read_ring()
+            if start and not self._writer_probe(now):
                 if ensure_running(self.paths):
-                    refreshed = _ring_snapshot(self.paths, self.max_age)
+                    self._writer_alive = True
+                    self._writer_checked = time.monotonic()
+                    refreshed = self._read_ring()
                     if refreshed is not None:
                         snapshot = refreshed
             if snapshot is None and fallback:
@@ -149,6 +186,38 @@ class TelemetryClient:
             self._cached = snapshot
             self._cached_until = now + self.cache_seconds
             return snapshot
+
+    def _read_ring(self) -> Snapshot | None:
+        """Read the newest ring record; the caller holds the client lock."""
+        self._reader = _fresh_reader(self.paths, self._reader)
+        if self._reader is None:
+            return None
+        try:
+            return self._reader.latest(max_age=self.max_age)
+        except (OSError, RingUnavailable):
+            self._reader.close()
+            self._reader = None
+            return None
+
+    def _writer_probe(self, now: float) -> bool:
+        """Probe writer liveness, remembering the answer for one second.
+
+        The lock-file probe stays authoritative - a fresh ring record from an
+        exited writer never counts as liveness - but reusing the result
+        briefly avoids an open and flock per poll and only bounds how quickly
+        a daemon exit is noticed, by at most that second.
+        """
+        if now - self._writer_checked >= 1.0:
+            self._writer_alive = _writer_active(self.paths)
+            self._writer_checked = now
+        return self._writer_alive
+
+    def close(self) -> None:
+        """Release the cached ring mapping."""
+        with self._lock:
+            if self._reader is not None:
+                self._reader.close()
+                self._reader = None
 
     def pane(
         self,

@@ -10,7 +10,7 @@ from helpers import linux_tree
 from kilix_telemetry.client import TelemetryClient, ensure_running
 from kilix_telemetry.daemon import run_daemon
 from kilix_telemetry.registry import PaneRegistry
-from kilix_telemetry.ring import TelemetryError, resolve_paths
+from kilix_telemetry.ring import RingReader, TelemetryError, resolve_paths
 
 
 class DaemonClientTests(unittest.TestCase):
@@ -111,6 +111,75 @@ class DaemonClientTests(unittest.TestCase):
                 clock[0] += 20.0
                 client.pane(200, start=False, force=True)
             self.assertEqual(PaneRegistry(paths).roots(), (200,))
+
+    def test_uncached_snapshots_reuse_one_ring_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = base / "linux"
+            root.mkdir()
+            linux_tree(root)
+            paths = resolve_paths(base / "runtime")
+            self.assertEqual(
+                run_daemon(
+                    paths=paths,
+                    root=root,
+                    once=True,
+                    slot_count=2,
+                    slot_size=64 * 1024,
+                ),
+                0,
+            )
+            client = TelemetryClient(paths)
+            try:
+                with mock.patch(
+                    "kilix_telemetry.client.RingReader", side_effect=RingReader
+                ) as opened:
+                    first = client.snapshot(start=False, fallback=False, force=True)
+                    second = client.snapshot(start=False, fallback=False, force=True)
+                self.assertIsNotNone(first)
+                self.assertIsNotNone(second)
+                self.assertEqual(opened.call_count, 1)
+            finally:
+                client.close()
+
+    def test_replaced_ring_file_is_reopened_by_the_client(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = base / "linux"
+            root.mkdir()
+            linux_tree(root)
+            paths = resolve_paths(base / "runtime")
+            self.assertEqual(
+                run_daemon(
+                    paths=paths,
+                    root=root,
+                    once=True,
+                    slot_count=4,
+                    slot_size=128 * 1024,
+                ),
+                0,
+            )
+            client = TelemetryClient(paths)
+            try:
+                first = client.snapshot(start=False, fallback=False, force=True)
+                self.assertIsNotNone(first)
+                # A restart with different geometry renames a new ring file
+                # over the path; the cached mapping must not serve stale data.
+                self.assertEqual(
+                    run_daemon(
+                        paths=paths,
+                        root=root,
+                        once=True,
+                        slot_count=2,
+                        slot_size=64 * 1024,
+                    ),
+                    0,
+                )
+                second = client.snapshot(start=False, fallback=False, force=True)
+                self.assertIsNotNone(second)
+                self.assertGreater(second.monotonic_ns, first.monotonic_ns)
+            finally:
+                client.close()
 
     def test_daemon_handles_an_unpublishable_once_sample(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
