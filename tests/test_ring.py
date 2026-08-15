@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import random
 import tempfile
 import unittest
@@ -46,6 +47,64 @@ class RingTests(unittest.TestCase):
                         [sample.sequence for sample in reader.history()],
                         [3, 4, 5],
                     )
+
+    def test_geometry_change_swaps_the_ring_file_under_live_readers(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "linux"
+            runtime = Path(temporary) / "runtime"
+            root.mkdir()
+            linux_tree(root)
+            base = LinuxCollector(root).sample()
+            paths = resolve_paths(runtime)
+            with RingWriter(paths, slot_count=4, slot_size=128 * 1024) as writer:
+                writer.publish(base)
+            reader = RingReader(paths)
+            try:
+                old_size = reader.size
+                with RingWriter(paths, slot_count=2, slot_size=64 * 1024):
+                    # The reader's inode is untouched: its complete mapping
+                    # stays readable and still holds the published record.
+                    self.assertEqual(
+                        len(reader.mapping[old_size - 4096 : old_size]), 4096
+                    )
+                    latest = reader.latest(max_age=None)
+                    self.assertIsNotNone(latest)
+                    self.assertEqual(latest.sequence, base.sequence)
+                    with RingReader(paths) as fresh:
+                        self.assertEqual(fresh.slot_count, 2)
+                        self.assertEqual(fresh.slot_size, 64 * 1024)
+            finally:
+                reader.close()
+
+    def test_unchanged_geometry_restart_keeps_the_mapped_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "linux"
+            runtime = Path(temporary) / "runtime"
+            root.mkdir()
+            linux_tree(root)
+            base = LinuxCollector(root).sample()
+            paths = resolve_paths(runtime)
+            with RingWriter(paths, slot_count=3, slot_size=64 * 1024) as writer:
+                writer.publish(base)
+            inode = os.stat(paths.ring).st_ino
+            reader = RingReader(paths)
+            try:
+                with RingWriter(paths, slot_count=3, slot_size=64 * 1024) as writer:
+                    self.assertEqual(os.stat(paths.ring).st_ino, inode)
+                    self.assertIsNone(reader.latest(max_age=None))
+                    writer.publish(
+                        replace(
+                            base,
+                            sequence=base.sequence + 1,
+                            monotonic_ns=base.monotonic_ns + 1,
+                            wall_time_ns=base.wall_time_ns + 1,
+                        )
+                    )
+                    refreshed = reader.latest(max_age=None)
+                    self.assertIsNotNone(refreshed)
+                    self.assertEqual(refreshed.sequence, base.sequence + 1)
+            finally:
+                reader.close()
 
     def test_symlinked_runtime_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

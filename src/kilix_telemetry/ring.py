@@ -196,12 +196,52 @@ class RingWriter:
         self.paths = paths or resolve_paths()
         self.slot_count, self.slot_size = _slot_parameters(slot_count, slot_size)
         _ensure_private_directory(self.paths.directory)
-        self.fd = _secure_open(self.paths.ring, os.O_CREAT | os.O_RDWR)
         self.size = HEADER_SIZE + self.slot_count * self.slot_size
-        os.ftruncate(self.fd, self.size)
-        self.mapping = mmap.mmap(self.fd, self.size, access=mmap.ACCESS_WRITE)
+        fd = _secure_open(self.paths.ring, os.O_CREAT | os.O_RDWR)
+        try:
+            if os.fstat(fd).st_size != self.size:
+                os.close(fd)
+                fd = -1
+                fd = self._replace_ring()
+            self.fd = fd
+            self.mapping = mmap.mmap(fd, self.size, access=mmap.ACCESS_WRITE)
+        except Exception:
+            if fd >= 0:
+                os.close(fd)
+            raise
         self.started_ns = time.monotonic_ns()
-        self._write_header(latest=0, heartbeat=self.started_ns)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        try:
+            self._write_header(latest=0, heartbeat=self.started_ns)
+        finally:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+
+    def _replace_ring(self) -> int:
+        """Swap in a resized ring file without truncating the published one.
+
+        Shrinking the live file in place would deliver SIGBUS to any reader
+        whose mapping extends past the new end of file. Building the resized
+        ring beside it and renaming it over the path keeps the inode a reader
+        has mapped intact; readers pick up the new file when they next open
+        or revalidate the path.
+        """
+        temporary = self.paths.ring.with_name(self.paths.ring.name + ".next")
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        fd = _secure_open(temporary, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+        try:
+            os.ftruncate(fd, self.size)
+            os.rename(temporary, self.paths.ring)
+        except Exception:
+            os.close(fd)
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
+        return fd
 
     def _write_header(self, *, latest: int, heartbeat: int) -> None:
         _HEADER.pack_into(
