@@ -111,6 +111,35 @@ class CollectorTests(unittest.TestCase):
                 [sensor.key for sensor in fourth.thermal],
             )
 
+    def test_zone_without_a_temp_input_does_not_force_rescans(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            linux_tree(root)
+            # A cooling-device-only zone: a directory with a type but no
+            # temp input, which can never produce a reading.
+            write(root, "sys/class/thermal/thermal_zone7/type", "acpitz\n")
+            clock = [1_000_000_000]
+            collector = LinuxCollector(root, monotonic_ns=lambda: clock[0])
+            first = collector.sample()
+            self.assertEqual(first.hottest_celsius, 72.0)
+
+            # Were the incomplete zone registered, every refresh would flag
+            # a full rescan and this new sensor would appear immediately
+            # instead of waiting for the slow rescan cadence.
+            write(root, "sys/class/hwmon/hwmon2/temp2_input", "44000\n")
+            clock[0] += 2_000_000_000
+            second = collector.sample()
+            self.assertNotIn(
+                "hwmon:hwmon2:nvme:temp2",
+                [sensor.key for sensor in second.thermal],
+            )
+            clock[0] += 2_000_000_000
+            third = collector.sample()
+            self.assertNotIn(
+                "hwmon:hwmon2:nvme:temp2",
+                [sensor.key for sensor in third.thermal],
+            )
+
     def test_removed_sensor_disappears_and_forces_a_rescan(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

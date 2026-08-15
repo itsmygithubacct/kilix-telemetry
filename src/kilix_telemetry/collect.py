@@ -681,6 +681,11 @@ class LinuxCollector:
         for zone in sorted(
             thermal_root.glob("thermal_zone*"), key=lambda path: _natural_key(path.name)
         ):
+            # A zone directory without a temp input can never produce a
+            # reading; registering it anyway would flag a topology rescan
+            # on every refresh when its absence is noticed.
+            if not (zone / "temp").exists():
+                continue
             zone_type = _safe_text(_read_text(zone / "type", 256)) or zone.name
             warning: float | None = None
             critical: float | None = None
