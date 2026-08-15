@@ -155,6 +155,9 @@ class TelemetryClient:
         self._reader: RingReader | None = None
         self._writer_alive = False
         self._writer_checked = float("-inf")
+        # Registration bookkeeping has its own lock so registering a pane
+        # never waits behind a snapshot poll that may be starting the daemon.
+        self._registry_lock = threading.Lock()
         self._pane_roots: dict[int, float] = {}
         self._registered_roots: tuple[int, ...] = ()
         self._registered_at = 0.0
@@ -243,7 +246,9 @@ class TelemetryClient:
         registry between singletons, resetting pane CPU deltas and PSS scope.
         Roots which have not been polled within the registry staleness window
         age out, and an unchanged set is re-registered only often enough to
-        keep its record fresh.
+        keep its record fresh. The bookkeeping and the registry write share
+        one critical section so two threads polling different panes cannot
+        interleave into recording a union that was never written.
         """
         if _disabled():
             return
@@ -253,21 +258,22 @@ class TelemetryClient:
             return
         if pid <= 0:
             return
-        now = time.monotonic()
-        self._pane_roots[pid] = now
-        horizon = now - DEFAULT_STALE_SECONDS
-        for known, seen in list(self._pane_roots.items()):
-            if seen < horizon:
-                del self._pane_roots[known]
-        union = tuple(sorted(self._pane_roots))
-        if (
-            union == self._registered_roots
-            and now - self._registered_at < DEFAULT_STALE_SECONDS / 3.0
-        ):
-            return
-        if self._write_pane_roots(union):
-            self._registered_roots = union
-            self._registered_at = now
+        with self._registry_lock:
+            now = time.monotonic()
+            self._pane_roots[pid] = now
+            horizon = now - DEFAULT_STALE_SECONDS
+            for known, seen in list(self._pane_roots.items()):
+                if seen < horizon:
+                    del self._pane_roots[known]
+            union = tuple(sorted(self._pane_roots))
+            if (
+                union == self._registered_roots
+                and now - self._registered_at < DEFAULT_STALE_SECONDS / 3.0
+            ):
+                return
+            if self._write_pane_roots(union):
+                self._registered_roots = union
+                self._registered_at = now
 
     def _write_pane_roots(self, roots: tuple[int, ...]) -> bool:
         try:
@@ -279,21 +285,22 @@ class TelemetryClient:
     def register_panes(self, roots: tuple[int, ...] | list[int]) -> bool:
         if _disabled():
             return False
-        if not self._write_pane_roots(tuple(roots)):
-            return False
-        now = time.monotonic()
-        accepted: dict[int, float] = {}
-        for item in tuple(roots):
-            try:
-                pid = int(item)
-            except (TypeError, ValueError):
-                continue
-            if pid > 0:
-                accepted[pid] = now
-        self._pane_roots = accepted
-        self._registered_roots = tuple(sorted(accepted))
-        self._registered_at = now
-        return True
+        with self._registry_lock:
+            if not self._write_pane_roots(tuple(roots)):
+                return False
+            now = time.monotonic()
+            accepted: dict[int, float] = {}
+            for item in tuple(roots):
+                try:
+                    pid = int(item)
+                except (TypeError, ValueError):
+                    continue
+                if pid > 0:
+                    accepted[pid] = now
+            self._pane_roots = accepted
+            self._registered_roots = tuple(sorted(accepted))
+            self._registered_at = now
+            return True
 
     def history(
         self,
