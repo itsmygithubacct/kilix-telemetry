@@ -15,7 +15,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Self
 
-from .model import Snapshot
+from .model import Snapshot, _descendant_pids, _process_children
 
 RING_MAGIC = b"KILIXTELEMETRY\0\0"
 RING_API_MAJOR = 1
@@ -277,19 +277,8 @@ class RingWriter:
     @staticmethod
     def _pane_process_ids(snapshot: Snapshot) -> set[int]:
         roots = {pane.root_pid for pane in snapshot.panes if pane.root_pid > 0}
-        children: dict[int, list[int]] = {}
-        by_pid = {process.pid: process for process in snapshot.processes}
-        for process in snapshot.processes:
-            children.setdefault(process.ppid, []).append(process.pid)
-        selected: set[int] = set()
-        pending = list(roots)
-        while pending:
-            pid = pending.pop()
-            if pid in selected or pid not in by_pid:
-                continue
-            selected.add(pid)
-            pending.extend(children.get(pid, ()))
-        return selected
+        live, children = _process_children(snapshot.processes)
+        return _descendant_pids(live, children, roots)
 
     def _fit(self, snapshot: Snapshot, capacity: int) -> tuple[bytes, int, int]:
         encoded = self._encode(snapshot)

@@ -3,11 +3,43 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
 SCHEMA_VERSION = 1
+
+
+def _process_children(processes: Iterable[Any]) -> tuple[set[int], dict[int, list[int]]]:
+    """Index one process table for descendant walks.
+
+    Returns the set of live PIDs and a parent-to-children map. The elements
+    only need ``pid`` and ``ppid`` attributes, so the sampler's raw records
+    and shared ``ProcessMetrics`` use the same walk.
+    """
+    live: set[int] = set()
+    children: dict[int, list[int]] = {}
+    for process in processes:
+        live.add(process.pid)
+        children.setdefault(process.ppid, []).append(process.pid)
+    return live, children
+
+
+def _descendant_pids(
+    live: set[int],
+    children: Mapping[int, list[int]],
+    roots: Iterable[int],
+) -> set[int]:
+    """Collect every listed root present in the table plus its descendants."""
+    selected: set[int] = set()
+    pending = list(roots)
+    while pending:
+        pid = pending.pop()
+        if pid in selected or pid not in live:
+            continue
+        selected.add(pid)
+        pending.extend(children.get(pid, ()))
+    return selected
 
 
 def _finite_float(value: object, default: float = 0.0) -> float:
@@ -279,22 +311,11 @@ class Snapshot:
         by_pid = {process.pid: process for process in self.processes}
         if root_pid <= 0 or root_pid not in by_pid:
             return PaneMetrics(root_pid, 0, 0.0, 0, 0, False)
-        children: dict[int, list[int]] = {}
-        for process in self.processes:
-            children.setdefault(process.ppid, []).append(process.pid)
-        selected: list[ProcessMetrics] = []
-        pending = [root_pid]
-        seen: set[int] = set()
-        while pending:
-            pid = pending.pop()
-            if pid in seen:
-                continue
-            seen.add(pid)
-            process = by_pid.get(pid)
-            if process is None:
-                continue
-            selected.append(process)
-            pending.extend(children.get(pid, ()))
+        live, children = _process_children(self.processes)
+        selected = [
+            by_pid[pid]
+            for pid in sorted(_descendant_pids(live, children, (root_pid,)))
+        ]
         pss_values = [process.pss_bytes for process in selected]
         complete_pss = bool(selected) and all(value is not None for value in pss_values)
         proportional = sum(

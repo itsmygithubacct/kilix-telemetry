@@ -17,6 +17,8 @@ from .model import (
     Snapshot,
     SystemMetrics,
     ThermalSensor,
+    _descendant_pids,
+    _process_children,
 )
 
 KIB = 1024
@@ -398,21 +400,12 @@ class LinuxCollector:
         current = {
             process.pid: (process.start_ticks, process.cpu_ticks) for process in raw
         }
-        children: dict[int, list[int]] = {}
+        live, children = _process_children(raw)
         by_pid = {process.pid: process for process in raw}
-        for process in raw:
-            children.setdefault(process.ppid, []).append(process.pid)
         trees: dict[int, tuple[int, ...]] = {}
         pss_pids: set[int] = set()
         for root_pid in pss_roots:
-            selected: set[int] = set()
-            pending = [root_pid]
-            while pending:
-                pid = pending.pop()
-                if pid in selected or pid not in by_pid:
-                    continue
-                selected.add(pid)
-                pending.extend(children.get(pid, ()))
+            selected = _descendant_pids(live, children, (root_pid,))
             trees[root_pid] = tuple(sorted(selected))
             pss_pids.update(selected)
         result: list[ProcessMetrics] = []
