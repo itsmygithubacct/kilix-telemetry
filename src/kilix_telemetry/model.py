@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable, Mapping
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from typing import Any
 
 SCHEMA_VERSION = 1
@@ -276,6 +276,97 @@ class PaneMetrics:
         )
 
 
+def _thermal_dict(sensor: ThermalSensor) -> dict[str, Any]:
+    return {
+        "key": sensor.key,
+        "chip": sensor.chip,
+        "label": sensor.label,
+        "source": sensor.source,
+        "celsius": sensor.celsius,
+        "warning_celsius": sensor.warning_celsius,
+        "critical_celsius": sensor.critical_celsius,
+    }
+
+
+def _fan_dict(sensor: FanSensor) -> dict[str, Any]:
+    return {
+        "key": sensor.key,
+        "chip": sensor.chip,
+        "label": sensor.label,
+        "source": sensor.source,
+        "rpm": sensor.rpm,
+    }
+
+
+def _process_dict(process: ProcessMetrics) -> dict[str, Any]:
+    return {
+        "pid": process.pid,
+        "ppid": process.ppid,
+        "start_ticks": process.start_ticks,
+        "cpu_ticks": process.cpu_ticks,
+        "cpu_cores": process.cpu_cores,
+        "rss_bytes": process.rss_bytes,
+        "pss_bytes": process.pss_bytes,
+        "virtual_bytes": process.virtual_bytes,
+        "uid": process.uid,
+        "name": process.name,
+        "state": process.state,
+        "threads": process.threads,
+        "command": process.command,
+        "anon_bytes": process.anon_bytes,
+        "file_bytes": process.file_bytes,
+        "shared_bytes": process.shared_bytes,
+    }
+
+
+def _system_dict(system: SystemMetrics) -> dict[str, Any]:
+    return {
+        "cpu_percent": system.cpu_percent,
+        "load_1": system.load_1,
+        "load_5": system.load_5,
+        "load_15": system.load_15,
+        "logical_cpus": system.logical_cpus,
+        "uptime_seconds": system.uptime_seconds,
+        "memory_total": system.memory_total,
+        "memory_available": system.memory_available,
+        "memory_free": system.memory_free,
+        "memory_buffers": system.memory_buffers,
+        "memory_cached": system.memory_cached,
+        "memory_reclaimable": system.memory_reclaimable,
+        "memory_shared": system.memory_shared,
+        "memory_active": system.memory_active,
+        "memory_inactive": system.memory_inactive,
+        "memory_anon": system.memory_anon,
+        "memory_slab": system.memory_slab,
+        "memory_page_tables": system.memory_page_tables,
+        "memory_kernel_stack": system.memory_kernel_stack,
+        "memory_dirty": system.memory_dirty,
+        "memory_writeback": system.memory_writeback,
+        "swap_total": system.swap_total,
+        "swap_free": system.swap_free,
+        "pressure": {
+            resource: dict(values) for resource, values in system.pressure.items()
+        },
+        "vm": dict(system.vm),
+        "per_cpu_percent": tuple(system.per_cpu_percent),
+        "cpu_frequency_mhz": tuple(system.cpu_frequency_mhz),
+        "memory_huge_total": system.memory_huge_total,
+        "memory_huge_free": system.memory_huge_free,
+        "memory_huge_page_size": system.memory_huge_page_size,
+    }
+
+
+def _pane_dict(pane: PaneMetrics) -> dict[str, Any]:
+    return {
+        "root_pid": pane.root_pid,
+        "process_count": pane.process_count,
+        "cpu_cores": pane.cpu_cores,
+        "rss_bytes": pane.rss_bytes,
+        "proportional_bytes": pane.proportional_bytes,
+        "complete_pss": pane.complete_pss,
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class Snapshot:
     sequence: int
@@ -332,7 +423,27 @@ class Snapshot:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        """Build the schema-1 wire dictionary without dataclass reflection.
+
+        Field-by-field construction matches ``dataclasses.asdict`` exactly
+        (a test pins the equivalence) while avoiding its deep recursion over
+        every process record on the sampler's once-per-second publish path.
+        """
+        return {
+            "sequence": self.sequence,
+            "wall_time_ns": self.wall_time_ns,
+            "monotonic_ns": self.monotonic_ns,
+            "interval_ns": self.interval_ns,
+            "boot_id": self.boot_id,
+            "system": _system_dict(self.system),
+            "thermal": tuple(_thermal_dict(sensor) for sensor in self.thermal),
+            "processes": tuple(_process_dict(process) for process in self.processes),
+            "fans": tuple(_fan_dict(fan) for fan in self.fans),
+            "schema": self.schema,
+            "panes": tuple(_pane_dict(pane) for pane in self.panes),
+            "processes_total": self.processes_total,
+            "processes_truncated": self.processes_truncated,
+        }
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> Snapshot:

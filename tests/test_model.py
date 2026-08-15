@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import dataclasses
 import unittest
 
 from kilix_telemetry.model import (
+    FanSensor,
     PaneMetrics,
     ProcessMetrics,
     Snapshot,
     SystemMetrics,
+    ThermalSensor,
 )
 
 
@@ -80,6 +83,49 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(pane.proportional_bytes, 530)
         self.assertFalse(pane.complete_pss)
         self.assertEqual(sample.pane(999).process_count, 0)
+
+    def test_to_dict_matches_dataclass_reflection(self) -> None:
+        rich_system = dataclasses.replace(
+            system(),
+            pressure={"cpu": {"some_avg10": 1.5}, "memory": {"full_avg10": 0.5}},
+            vm={"pgfault": 10, "oom_kill": 0},
+            per_cpu_percent=(10.0, None),
+            cpu_frequency_mhz=(2400.0, None),
+            memory_huge_total=8,
+        )
+        sample = Snapshot(
+            1,
+            2,
+            3,
+            4,
+            "boot",
+            rich_system,
+            (
+                ThermalSensor(
+                    "zone:0:x86_pkg_temp",
+                    "CPU",
+                    "zone 0",
+                    "thermal-zone",
+                    55.5,
+                    90.0,
+                    100.0,
+                ),
+                ThermalSensor(
+                    "hwmon:hwmon2:nvme:temp1", "NVMe", "Composite", "hwmon2", 41.0
+                ),
+            ),
+            (
+                process(10, 1, 0.5, 100, 80),
+                process(11, 10, 0.25, 50, None),
+            ),
+            fans=(
+                FanSensor("fan:hwmon2:nvme:fan1", "NVMe", "Controller", "hwmon2", 1200),
+            ),
+            panes=(PaneMetrics(10, 2, 0.75, 150, 130, False),),
+            processes_total=5,
+            processes_truncated=True,
+        )
+        self.assertEqual(sample.to_dict(), dataclasses.asdict(sample))
 
     def test_round_trip_rejects_an_unknown_schema(self) -> None:
         sample = Snapshot(1, 2, 3, 4, "boot", system(), (), ())

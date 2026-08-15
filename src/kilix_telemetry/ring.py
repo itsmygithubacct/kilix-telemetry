@@ -15,7 +15,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Self
 
-from .model import Snapshot, _descendant_pids, _process_children
+from .model import Snapshot, _descendant_pids, _process_children, _process_dict
 
 RING_MAGIC = b"KILIXTELEMETRY\0\0"
 RING_API_MAJOR = 1
@@ -260,19 +260,23 @@ class RingWriter:
         )
 
     @staticmethod
+    def _pack(raw: bytes) -> tuple[bytes, int, int]:
+        compressed = zlib.compress(raw, level=1)
+        if len(compressed) < len(raw):
+            return compressed, FLAG_ZLIB, len(raw)
+        return raw, 0, len(raw)
+
+    @staticmethod
     def _encode(snapshot: Snapshot) -> tuple[bytes, int, int]:
+        # Key order is not part of the record contract: readers parse the
+        # JSON into dictionaries and the CRC covers integrity, so sorting
+        # every key on the publish path would buy nothing.
         raw = json.dumps(
             snapshot.to_dict(),
             ensure_ascii=False,
             separators=(",", ":"),
-            sort_keys=True,
         ).encode("utf-8")
-        compressed = zlib.compress(raw, level=1)
-        if len(compressed) < len(raw):
-            payload, flags = compressed, FLAG_ZLIB
-        else:
-            payload, flags = raw, 0
-        return payload, flags, len(raw)
+        return RingWriter._pack(raw)
 
     @staticmethod
     def _pane_process_ids(snapshot: Snapshot) -> set[int]:
@@ -310,27 +314,61 @@ class RingWriter:
                 process.pid,
             ),
         )
-        low = 0
-        high = len(prioritized)
-        best: tuple[bytes, int, int] | None = None
-        while low <= high:
-            count = (low + high) // 2
-            candidate = replace(
-                compact,
-                processes=tuple(
-                    sorted(prioritized[:count], key=lambda process: process.pid)
-                ),
-            )
-            candidate_encoded = self._encode(candidate)
-            if len(candidate_encoded[0]) <= capacity:
-                best = candidate_encoded
-                low = count + 1
-            else:
-                high = count - 1
+        best = self._fit_processes(compact, prioritized, capacity)
         if best is None:
             raise TelemetryError(
                 "telemetry snapshot metadata exceeds the ring slot capacity"
             )
+        return best
+
+    @classmethod
+    def _fit_processes(
+        cls, compact: Snapshot, prioritized: list, capacity: int
+    ) -> tuple[bytes, int, int] | None:
+        """Binary-search the retained process count with one serialization.
+
+        The snapshot skeleton and each process record are serialized once;
+        every probe then only joins precomputed fragments and compresses the
+        result, instead of re-running the whole dict-and-dump pipeline per
+        probe on the tick where the table is largest. The assembled bytes are
+        identical to encoding the candidate snapshot directly (a test pins
+        this), because JSON escapes any quote inside string values, so the
+        empty processes array below is unambiguous.
+        """
+        skeleton = json.dumps(
+            replace(compact, processes=()).to_dict(),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        prefix, marker, suffix = skeleton.partition('"processes":[]')
+        if not marker:  # pragma: no cover - to_dict always emits the array
+            raise TelemetryError("telemetry snapshot skeleton is malformed")
+        indexed = [
+            (
+                process.pid,
+                json.dumps(
+                    _process_dict(process), ensure_ascii=False, separators=(",", ":")
+                ),
+            )
+            for process in prioritized
+        ]
+        low = 0
+        high = len(indexed)
+        best: tuple[bytes, int, int] | None = None
+        while low <= high:
+            count = (low + high) // 2
+            body = ",".join(
+                fragment
+                for _, fragment in sorted(indexed[:count], key=lambda item: item[0])
+            )
+            candidate = cls._pack(
+                f'{prefix}"processes":[{body}]{suffix}'.encode("utf-8")
+            )
+            if len(candidate[0]) <= capacity:
+                best = candidate
+                low = count + 1
+            else:
+                high = count - 1
         return best
 
     def publish(self, snapshot: Snapshot) -> None:

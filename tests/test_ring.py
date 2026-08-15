@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import random
 import tempfile
 import unittest
+import zlib
 from dataclasses import replace
 from pathlib import Path
 from unittest import mock
@@ -14,6 +16,7 @@ from helpers import linux_tree
 from kilix_telemetry.collect import LinuxCollector
 from kilix_telemetry.model import Snapshot
 from kilix_telemetry.ring import (
+    SLOT_HEADER_SIZE,
     DaemonLock,
     RingReader,
     RingWriter,
@@ -21,6 +24,29 @@ from kilix_telemetry.ring import (
     daemon_running,
     resolve_paths,
 )
+
+
+def _oversized_fixture(temporary):
+    """Build a snapshot whose process table overflows a 64 KiB slot."""
+    root = Path(temporary) / "linux"
+    runtime = Path(temporary) / "runtime"
+    root.mkdir()
+    linux_tree(root)
+    base = LinuxCollector(root).sample(pss_roots=(100,))
+    template = base.processes[0]
+    generator = random.Random(0)
+    alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    processes = tuple(
+        replace(
+            template,
+            pid=1_000 + index,
+            ppid=1,
+            command="".join(generator.choices(alphabet, k=2048)),
+        )
+        for index in range(160)
+    )
+    oversized = replace(base, processes=processes, processes_total=len(processes))
+    return resolve_paths(runtime), base, oversized
 
 
 class RingTests(unittest.TestCase):
@@ -164,37 +190,54 @@ class RingTests(unittest.TestCase):
 
     def test_large_process_table_is_compacted_without_losing_pane_metrics(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary) / "linux"
-            runtime = Path(temporary) / "runtime"
-            root.mkdir()
-            linux_tree(root)
-            base = LinuxCollector(root).sample(pss_roots=(100,))
-            template = base.processes[0]
-            generator = random.Random(0)
-            alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-            processes = tuple(
-                replace(
-                    template,
-                    pid=1_000 + index,
-                    ppid=1,
-                    command="".join(generator.choices(alphabet, k=2048)),
-                )
-                for index in range(160)
-            )
-            oversized = replace(
-                base,
-                processes=processes,
-                processes_total=len(processes),
-            )
-            paths = resolve_paths(runtime)
+            paths, base, oversized = _oversized_fixture(temporary)
             with RingWriter(paths, slot_count=2, slot_size=64 * 1024) as writer:
                 writer.publish(oversized)
                 with RingReader(paths) as reader:
                     decoded = reader.latest(max_age=None)
             self.assertIsNotNone(decoded)
             self.assertTrue(decoded.processes_truncated)
-            self.assertEqual(decoded.processes_total, len(processes))
+            self.assertEqual(decoded.processes_total, len(oversized.processes))
             self.assertEqual(decoded.pane(100), base.pane(100))
+
+    def test_compacted_payload_matches_a_direct_encode(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths, _, oversized = _oversized_fixture(temporary)
+            with RingWriter(paths, slot_count=2, slot_size=64 * 1024) as writer:
+                capacity = writer.slot_size - SLOT_HEADER_SIZE
+                payload, flags, raw_size = writer._fit(oversized, capacity)
+                self.assertLessEqual(len(payload), capacity)
+                raw = zlib.decompress(payload) if flags else payload
+                self.assertEqual(len(raw), raw_size)
+                decoded = Snapshot.from_dict(json.loads(raw))
+                # Re-encoding the surviving snapshot the ordinary way must
+                # reproduce the fitted payload byte for byte.
+                candidate = replace(
+                    oversized,
+                    processes=decoded.processes,
+                    processes_total=decoded.processes_total,
+                    processes_truncated=True,
+                )
+                self.assertEqual(
+                    RingWriter._encode(candidate), (payload, flags, raw_size)
+                )
+
+    def test_overflow_probes_do_not_reencode_the_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths, _, oversized = _oversized_fixture(temporary)
+            with RingWriter(paths, slot_count=2, slot_size=64 * 1024) as writer:
+                real = RingWriter._encode
+                with mock.patch.object(
+                    RingWriter, "_encode", side_effect=real
+                ) as encode:
+                    writer.publish(oversized)
+                # One probe for the full table and one for the bounded-argv
+                # compaction; the binary search reuses precomputed fragments.
+                self.assertLessEqual(encode.call_count, 2)
+                with RingReader(paths) as reader:
+                    decoded = reader.latest(max_age=None)
+            self.assertIsNotNone(decoded)
+            self.assertTrue(decoded.processes_truncated)
 
 
 if __name__ == "__main__":
