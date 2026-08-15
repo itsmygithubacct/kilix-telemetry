@@ -26,8 +26,16 @@ from kilix_telemetry.ring import (
 )
 
 
-def _oversized_fixture(temporary):
-    """Build a snapshot whose process table overflows a 64 KiB slot."""
+def _oversized_fixture(temporary, *, count=300, command_length=512):
+    """Build a snapshot whose process table overflows a 64 KiB slot.
+
+    The defaults produce a table that still overflows the slot after the
+    writer bounds every command to 512 characters (incompressible commands
+    already at that bound), so fitting it must drop whole processes through
+    the retained-count search rather than return early from truncation
+    alone. Passing a longer ``command_length`` with a smaller ``count``
+    instead exercises the truncation-only path.
+    """
     root = Path(temporary) / "linux"
     runtime = Path(temporary) / "runtime"
     root.mkdir()
@@ -41,9 +49,9 @@ def _oversized_fixture(temporary):
             template,
             pid=1_000 + index,
             ppid=1,
-            command="".join(generator.choices(alphabet, k=2048)),
+            command="".join(generator.choices(alphabet, k=command_length)),
         )
-        for index in range(160)
+        for index in range(count)
     )
     oversized = replace(base, processes=processes, processes_total=len(processes))
     return resolve_paths(runtime), base, oversized
@@ -198,6 +206,30 @@ class RingTests(unittest.TestCase):
             self.assertIsNotNone(decoded)
             self.assertTrue(decoded.processes_truncated)
             self.assertEqual(decoded.processes_total, len(oversized.processes))
+            # The record really went through the retained-count search:
+            # some processes were dropped, yet not all of them.
+            self.assertGreater(len(decoded.processes), 0)
+            self.assertLess(len(decoded.processes), len(oversized.processes))
+            self.assertEqual(decoded.pane(100), base.pane(100))
+
+    def test_long_commands_are_truncated_before_processes_are_dropped(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths, base, oversized = _oversized_fixture(
+                temporary, count=160, command_length=2048
+            )
+            with RingWriter(paths, slot_count=2, slot_size=64 * 1024) as writer:
+                writer.publish(oversized)
+                with RingReader(paths) as reader:
+                    decoded = reader.latest(max_age=None)
+            self.assertIsNotNone(decoded)
+            self.assertTrue(decoded.processes_truncated)
+            # Bounding every command to 512 characters makes this table fit,
+            # so no process record is sacrificed.
+            self.assertEqual(len(decoded.processes), len(oversized.processes))
+            self.assertEqual(
+                [process.command for process in decoded.processes],
+                [process.command[:512] for process in oversized.processes],
+            )
             self.assertEqual(decoded.pane(100), base.pane(100))
 
     def test_compacted_payload_matches_a_direct_encode(self) -> None:
@@ -210,6 +242,11 @@ class RingTests(unittest.TestCase):
                 raw = zlib.decompress(payload) if flags else payload
                 self.assertEqual(len(raw), raw_size)
                 decoded = Snapshot.from_dict(json.loads(raw))
+                # Guard against a fixture that fits after truncation alone:
+                # the payload under test must come from the fragment-splicing
+                # search, which shows as a strict subset of the table.
+                self.assertGreater(len(decoded.processes), 0)
+                self.assertLess(len(decoded.processes), len(oversized.processes))
                 # Re-encoding the surviving snapshot the ordinary way must
                 # reproduce the fitted payload byte for byte.
                 candidate = replace(
@@ -232,12 +269,16 @@ class RingTests(unittest.TestCase):
                 ) as encode:
                     writer.publish(oversized)
                 # One probe for the full table and one for the bounded-argv
-                # compaction; the binary search reuses precomputed fragments.
+                # compaction; the retained-count binary search that follows
+                # reuses precomputed fragments instead of re-encoding.
                 self.assertLessEqual(encode.call_count, 2)
                 with RingReader(paths) as reader:
                     decoded = reader.latest(max_age=None)
             self.assertIsNotNone(decoded)
             self.assertTrue(decoded.processes_truncated)
+            # Dropped processes prove the search ran; without them the probe
+            # ceiling above would be trivially satisfied by the early returns.
+            self.assertLess(len(decoded.processes), decoded.processes_total)
 
 
 if __name__ == "__main__":
