@@ -55,6 +55,22 @@ further and lower-priority process detail is trimmed while global and pane
 aggregates remain intact; an irreducible record is skipped without terminating
 the long-running sampler.
 
+Automatic startup registers each consuming process under the private runtime
+with its boot ID, PID namespace, PID and process start tick. The sampler exits
+after five seconds without a matching live consumer. Closing one window keeps
+it running for other consumers; a crashed or failed launcher does not leave an
+unowned sampler. The bounded registry drops dead identities on new registrations.
+A client lease lasts for the process, so closing one of several client objects
+cannot revoke another object's use. Forked clients register the child's identity
+on its first automatic snapshot request.
+
+`serve` remains persistent by default for explicit service management. Pass
+`--idle-timeout SECONDS` to use consumer lifetime management. Configured
+`KILIX_TELEMETRY_COMMAND` overrides retain their selected lifecycle policy.
+`start --owner-pid PID` registers a launcher before starting the automatic
+sampler; ordinary Python clients register themselves. A timed out command that
+never acquired the writer lock is terminated and reaped as an owned child.
+
 ## Commands
 
 ```sh

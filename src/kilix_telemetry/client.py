@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 
 from .collect import LinuxCollector
+from .consumers import ConsumerRegistry
 from .model import PaneMetrics, Snapshot
 from .registry import DEFAULT_STALE_SECONDS, PaneRegistry
 from .ring import (
@@ -33,7 +34,8 @@ def _daemon_command() -> list[str]:
     configured = os.environ.get("KILIX_TELEMETRY_COMMAND", "").strip()
     if configured:
         return shlex.split(configured)
-    return [sys.executable, "-m", "kilix_telemetry", "serve", "--quiet"]
+    return [sys.executable, "-m", "kilix_telemetry", "serve", "--quiet",
+            "--idle-timeout", "5"]
 
 
 def _spawn_environment(paths: TelemetryPaths) -> dict[str, str]:
@@ -86,11 +88,16 @@ def ensure_running(
     paths: TelemetryPaths | None = None,
     *,
     timeout: float = 2.5,
+    owner_pid: int | None = None,
 ) -> bool:
     """Ensure a fresh writer exists without making consumers depend on it."""
     if _disabled():
         return False
     paths = paths or resolve_paths()
+    try:
+        ConsumerRegistry(paths).register(os.getpid() if owner_pid is None else owner_pid)
+    except (OSError, ValueError, TelemetryError):
+        return False
     if _writer_active(paths):
         return True
     command = _daemon_command()
@@ -100,7 +107,7 @@ def ensure_running(
     destination = None if debug else subprocess.DEVNULL
     started_ns = time.monotonic_ns()
     try:
-        subprocess.Popen(
+        process = subprocess.Popen(
             command,
             stdin=subprocess.DEVNULL,
             stdout=destination,
@@ -113,6 +120,7 @@ def ensure_running(
         return False
     deadline = time.monotonic() + max(0.0, timeout)
     reader: RingReader | None = None
+    succeeded = False
     try:
         while time.monotonic() < deadline:
             reader = _fresh_reader(paths, reader)
@@ -128,12 +136,31 @@ def ensure_running(
                 and sample is not None
                 and sample.monotonic_ns >= started_ns
             ):
+                succeeded = True
                 return True
+            if process.poll() is not None and not _writer_active(paths):
+                return False
             time.sleep(0.05)
-        return _writer_active(paths)
+        succeeded = _writer_active(paths)
+        return succeeded
     finally:
         if reader is not None:
             reader.close()
+        if not succeeded and process.poll() is None:
+            # A command that never became a writer is still our direct child.
+            # Do not abandon a stalled startup or signal a shared writer.
+            process.terminate()
+            try:
+                process.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                try:
+                    process.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    pass
+        # Reap concurrent-start losers and eventual idle exits while this
+        # consumer is alive. The daemon thread does not extend its lifetime.
+        threading.Thread(target=process.wait, daemon=True).start()
 
 
 class TelemetryClient:
@@ -161,6 +188,7 @@ class TelemetryClient:
         self._pane_roots: dict[int, float] = {}
         self._registered_roots: tuple[int, ...] = ()
         self._registered_at = 0.0
+        self._consumer_pid: int | None = None
 
     def snapshot(
         self,
@@ -169,6 +197,12 @@ class TelemetryClient:
         fallback: bool = True,
         force: bool = False,
     ) -> Snapshot | None:
+        if start and self._consumer_pid != os.getpid() and not _disabled():
+            try:
+                ConsumerRegistry(self.paths).register(os.getpid())
+                self._consumer_pid = os.getpid()
+            except (OSError, ValueError, TelemetryError):
+                pass
         now = time.monotonic()
         if not force and self._cached is not None and now < self._cached_until:
             return self._cached

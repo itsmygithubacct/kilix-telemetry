@@ -8,7 +8,7 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
-from .client import TelemetryClient
+from .client import TelemetryClient, ensure_running
 from .collect import LinuxCollector
 from .daemon import configured_interval, configured_pss_interval, run_daemon
 from .ring import (
@@ -48,6 +48,10 @@ def _parser() -> argparse.ArgumentParser:
     serve.add_argument("--slot-size", type=int, default=DEFAULT_SLOT_SIZE)
     serve.add_argument("--once", action="store_true")
     serve.add_argument("--quiet", action="store_true")
+    serve.add_argument("--idle-timeout", type=float, default=0.0,
+                       help="exit after this many seconds without live consumers; 0 stays persistent")
+    start = subparsers.add_parser("start", help="start a sampler owned by a live process")
+    start.add_argument("--owner-pid", type=int, required=True)
 
     snapshot = subparsers.add_parser("snapshot", help="print the newest sample")
     snapshot.add_argument(
@@ -84,6 +88,8 @@ def main(argv: list[str] | None = None) -> int:
     runtime = getattr(arguments, "command_runtime", None) or arguments.runtime
     paths = resolve_paths(runtime)
     command = arguments.command or "status"
+    if command == "start":
+        return 0 if ensure_running(paths, owner_pid=arguments.owner_pid) else 1
     if command == "serve":
         result = run_daemon(
             paths=paths,
@@ -93,6 +99,7 @@ def main(argv: list[str] | None = None) -> int:
             slot_count=arguments.slots,
             slot_size=arguments.slot_size,
             once=arguments.once,
+            idle_timeout=arguments.idle_timeout,
         )
         if not arguments.quiet and result == 0:
             print(f"kilix-telemetry: ring {paths.ring}")

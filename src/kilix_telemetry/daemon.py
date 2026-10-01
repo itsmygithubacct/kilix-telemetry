@@ -9,6 +9,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from .collect import LinuxCollector
+from .consumers import ConsumerRegistry
 from .registry import PaneRegistry
 from .ring import (
     DEFAULT_SLOT_COUNT,
@@ -31,6 +32,7 @@ def run_daemon(
     slot_count: int = DEFAULT_SLOT_COUNT,
     slot_size: int = DEFAULT_SLOT_SIZE,
     once: bool = False,
+    idle_timeout: float = 0.0,
     ready: Callable[[], None] | None = None,
 ) -> int:
     """Run the sampler in the foreground.
@@ -59,7 +61,14 @@ def run_daemon(
             registry = PaneRegistry(paths)
             deadline = time.monotonic()
             first = True
+            consumers = ConsumerRegistry(paths)
+            idle_since = time.monotonic()
             while not stopping:
+                if idle_timeout > 0:
+                    if consumers.active():
+                        idle_since = time.monotonic()
+                    elif time.monotonic() - idle_since >= idle_timeout:
+                        break
                 snapshot = collector.sample(pss_roots=registry.roots())
                 try:
                     ring.publish(snapshot)
