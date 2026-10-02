@@ -199,7 +199,13 @@ class RingWriter:
         self.size = HEADER_SIZE + self.slot_count * self.slot_size
         fd = _secure_open(self.paths.ring, os.O_CREAT | os.O_RDWR)
         try:
-            if os.fstat(fd).st_size != self.size:
+            header = os.pread(fd, _HEADER.size, 0)
+            geometry_matches = (
+                len(header) == _HEADER.size
+                and _HEADER.unpack(header)[3:6]
+                == (HEADER_SIZE, self.slot_count, self.slot_size)
+            )
+            if os.fstat(fd).st_size != self.size or not geometry_matches:
                 os.close(fd)
                 fd = -1
                 fd = self._replace_ring()
@@ -217,7 +223,7 @@ class RingWriter:
             fcntl.flock(self.fd, fcntl.LOCK_UN)
 
     def _replace_ring(self) -> int:
-        """Swap in a resized ring file without truncating the published one.
+        """Swap in a ring file with new geometry without truncating the published one.
 
         Shrinking the live file in place would deliver SIGBUS to any reader
         whose mapping extends past the new end of file. Building the resized

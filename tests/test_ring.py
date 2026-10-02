@@ -58,6 +58,37 @@ def _oversized_fixture(temporary, *, count=300, command_length=512):
 
 
 class RingTests(unittest.TestCase):
+    def test_equal_size_geometry_restart_refreshes_cached_reader(self) -> None:
+        from kilix_telemetry.client import _fresh_reader
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "linux"
+            root.mkdir()
+            linux_tree(root)
+            base = LinuxCollector(root).sample()
+            paths = resolve_paths(Path(temporary) / "runtime")
+            with RingWriter(paths, slot_count=4, slot_size=65536) as writer:
+                writer.publish(replace(base, sequence=2))
+            reader = RingReader(paths)
+            old_inode = os.fstat(reader.fd).st_ino
+            old_size = reader.size
+            try:
+                with RingWriter(paths, slot_count=2, slot_size=131072) as writer:
+                    writer.publish(replace(base, sequence=2))
+                    self.assertEqual(os.fstat(writer.fd).st_size, old_size)
+                    self.assertNotEqual(os.fstat(writer.fd).st_ino, old_inode)
+                    # The old mapping is intact and safe until the client refreshes.
+                    self.assertEqual(reader.latest(max_age=None).sequence, 2)
+                    refreshed = _fresh_reader(paths, reader)
+                    self.assertIsNot(refreshed, reader)
+                    reader = refreshed
+                    self.assertIsNotNone(reader)
+                    self.assertEqual(reader.latest(max_age=None).sequence, 2)
+                    self.assertEqual(reader.slot_size, 131072)
+            finally:
+                if reader is not None:
+                    reader.close()
+
     def test_bounded_round_trip_and_history(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "linux"
