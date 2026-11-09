@@ -113,8 +113,8 @@ install whose desktop is [Kilix](https://github.com/itsmygithubacct/kilix#readme
 running the [Kilix 95](https://github.com/itsmygithubacct/kilix-95#readme)
 desktop through [Pleb](https://github.com/itsmygithubacct/pleb#readme).
 It ships inside Kilix as the `third_party/kilix-telemetry` submodule and feeds
-every CPU, memory and temperature reading the desktop shows. The map of every
-repository and how it ships is on the
+the CPU, memory and temperature readings in Kilix's pane title bars and the
+System Center apps. The map of every repository and how it ships is on the
 [components page](https://github.com/itsmygithubacct/plebian-os/blob/main/docs/components.md).
 
 ## License
