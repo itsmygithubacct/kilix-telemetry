@@ -8,68 +8,24 @@ ring instead of independently walking the process table and hardware sensors.
 The component is deliberately separate from `kilix-state`. `kilix-state` owns
 durable, crash-safe application records. Telemetry is transient, newest-wins,
 and invalid as soon as its monotonic timestamp becomes stale.
+Ships in Plebian-OS 0.2.3 as a submodule of
+[Kilix](https://github.com/itsmygithubacct/kilix#readme)
+(`third_party/kilix-telemetry`). Kilix's pane title-bar CPU and memory chips,
+the System Center CPU, Memory and Temperatures apps, and `kilix telemetry`
+read from it; desktop providers reach it as `kilix_sdk.telemetry`.
 
-## Data model
+## What it does
 
-Each schema-1 snapshot contains:
-
-- global and per-logical-CPU utilization, current CPU frequency, and
-  1/5/15-minute system load;
-- logical CPU count, uptime, RAM, swap, Linux CPU/memory/I/O PSI, and the VM
-  counters used by Kilix Memory;
-- thermal-zone and hwmon temperatures with stable keys and available warning
-  and critical hints, plus hwmon fan tachometers;
-- one process table with PID, parent PID, start ticks, CPU ticks, CPU use in
-  logical cores, RSS, optional `smaps_rollup` PSS, identity, state, threads,
-  bounded argv, and the memory fields used by the process dashboard. The
-  `processes_total` and `processes_truncated` fields make any ring compaction
-  explicit to process-list consumers.
-
-`Snapshot.pane(root_pid)` follows the shared parent table and aggregates that
-root plus its descendants. Its CPU result is in **cores**, not system load:
-`1.0` means the pane's processes consumed one complete logical CPU during the
-last interval. Linux's waited-child counters retain CPU used by short commands
-which start and exit between process-table scans; a cumulative tree counter
-accounts for that work without counting it again when a live child is reaped.
-The retained start tick protects comparisons from PID reuse.
-Pane proportional memory sums PSS where the current user can read it and falls
-back to RSS for unavailable processes. Chrome instances publish their live root
-PIDs to a bounded, locked registry, so the sampler opens `smaps_rollup` only for
-registered pane descendants—not every process on the machine.
-
-## Ring and lifecycle
-
-The daemon creates `telemetry-v1.ring` under
-`$KILIX_TELEMETRY_RUNTIME`, `$XDG_RUNTIME_DIR/kilix/telemetry`, or a private
-per-UID `/tmp` fallback. The directory is mode 0700 and the mmap file and
-singleton lock are mode 0600; symlinked or foreign-owned endpoints are refused.
-
-The ring is bounded (32 × 512 KiB by default), zlib-compresses JSON records,
-and carries CRC, sequence, schema, wall-clock, monotonic, and writer heartbeat
-metadata. One writer holds an exclusive singleton lock. Readers take a short
-shared file lock while copying a slot, validate both sequence fields and CRC,
-and reject stale data. Status and lazy startup inspect the live singleton lock,
-not merely the age of the last record, so a dead daemon cannot leave a false
-running result. If a process table would exceed a ring slot, argv is bounded
-further and lower-priority process detail is trimmed while global and pane
-aggregates remain intact; an irreducible record is skipped without terminating
-the long-running sampler.
-
-Automatic startup registers each consuming process under the private runtime
-with its boot ID, PID namespace, PID and process start tick. The sampler exits
-after five seconds without a matching live consumer. Closing one window keeps
-it running for other consumers; a crashed or failed launcher does not leave an
-unowned sampler. The bounded registry drops dead identities on new registrations.
-A client lease lasts for the process, so closing one of several client objects
-cannot revoke another object's use. Forked clients register the child's identity
-on its first automatic snapshot request.
-
-`serve` remains persistent by default for explicit service management. Pass
-`--idle-timeout SECONDS` to use consumer lifetime management. Configured
-`KILIX_TELEMETRY_COMMAND` overrides retain their selected lifecycle policy.
-`start --owner-pid PID` registers a launcher before starting the automatic
-sampler; ordinary Python clients register themselves. A timed out command that
-never acquired the writer lock is terminated and reaped as an owned child.
+- Samples CPU (global, per logical CPU, frequency, load), memory, swap, PSI,
+  temperatures, fans and the process table from `/proc` and `/sys`, once per
+  user.
+- Publishes zlib-compressed JSON snapshots to a bounded, CRC-checked mmap ring
+  that any number of clients read without walking `/proc` themselves.
+- Aggregates a pane's process tree (`Snapshot.pane(root_pid)`): CPU in cores,
+  proportional memory from `smaps_rollup` where readable.
+- Starts lazily for its consumers and exits five seconds after the last one
+  goes; `serve` stays up for explicit service management.
+- Falls back to an in-process collector when the ring cannot be used.
 
 ## Commands
 
@@ -92,3 +48,75 @@ Set `KILIX_TELEMETRY_DISABLE=1` to exercise the fallback explicitly.
 Runtime dependencies: Python 3.11+ and Linux procfs/sysfs. The project is
 managed and locked with `uv`; it has no third-party runtime packages.
 The schema-1 component is first consumed by the Kilix 0.1.9 release.
+
+## Command reference
+
+| Command | What it does |
+|---|---|
+| `kilix-telemetry serve [--interval S] [--idle-timeout S] [--once]` | Run the single sampler in the foreground |
+| `kilix-telemetry start --owner-pid PID` | Start an automatic sampler owned by a live process |
+| `kilix-telemetry status` | Report daemon and ring health |
+| `kilix-telemetry snapshot [--no-processes] [--direct] [--no-start]` | Print the newest sample |
+| `kilix-telemetry pane PID` | Print one process-tree aggregate |
+| `kilix-telemetry history [--limit N] [--no-processes]` | Print recent ring samples |
+| `kilix-telemetry --runtime DIR ...` | Use another private runtime directory |
+
+| Environment | Effect |
+|---|---|
+| `KILIX_TELEMETRY_RUNTIME` | Runtime directory (default `$XDG_RUNTIME_DIR/kilix/telemetry`) |
+| `KILIX_TELEMETRY_DISABLE=1` | Skip the ring and use the in-process collector |
+| `KILIX_TELEMETRY_COMMAND` | Override the command that starts the sampler |
+| `KILIX_TELEMETRY_INTERVAL`, `KILIX_TELEMETRY_PSS_INTERVAL` | Default sampling interval and `smaps_rollup` interval for `serve`, in seconds |
+
+In Kilix the same commands are `kilix telemetry status`, `snapshot`,
+`pane PID` and `history`.
+
+## How it works
+
+```
+ /proc, /sys ──> sampler (one per user, singleton lock) ──> telemetry-v1.ring
+                         │                                   32 slots × 512 KiB
+                         │  registered consumers (boot id,    zlib JSON + CRC,
+                         │  pid namespace, pid, start tick)   sequence, heartbeat
+                         ▼                                          │
+                 exits 5 s after the last live consumer             ▼
+                                         TelemetryClient.snapshot() / .pane(pid)
+                                         (falls back to LinuxCollector)
+```
+
+One writer holds an exclusive lock on the ring; readers copy a slot under a
+short shared lock, check both sequence fields and the CRC, and refuse stale
+data. A process table too large for a slot is trimmed rather than stopping the
+sampler. Consumers register their identity, so a reused PID cannot keep a
+sampler alive. Details: [docs/design.md](docs/design.md).
+
+## Documentation
+
+| Document | Contents |
+|---|---|
+| [docs/design.md](docs/design.md) | Snapshot data model, pane aggregation, ring format, consumer lifecycle |
+
+## Related repositories
+
+- [kilix](https://github.com/itsmygithubacct/kilix#readme): pins this
+  component for its chrome, System Center apps and `kilix telemetry`.
+- [kilix-tui-utils](https://github.com/itsmygithubacct/kilix-tui-utils#readme):
+  system monitors that read Kilix telemetry.
+- [kilix-state](https://github.com/itsmygithubacct/kilix-state#readme):
+  durable records, which this transient source deliberately is not.
+
+## Part of Plebian-OS
+
+kilix-telemetry is one of the repositories behind
+[Plebian-OS](https://github.com/itsmygithubacct/plebian-os#readme), a Debian
+install whose desktop is [Kilix](https://github.com/itsmygithubacct/kilix#readme)
+running the [Kilix 95](https://github.com/itsmygithubacct/kilix-95#readme)
+desktop through [Pleb](https://github.com/itsmygithubacct/pleb#readme).
+It ships inside Kilix as the `third_party/kilix-telemetry` submodule and feeds
+every CPU, memory and temperature reading the desktop shows. The map of every
+repository and how it ships is on the
+[components page](https://github.com/itsmygithubacct/plebian-os/blob/main/docs/components.md).
+
+## License
+
+MIT. See [LICENSE](LICENSE).
