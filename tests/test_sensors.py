@@ -80,10 +80,27 @@ class SensorTests(unittest.TestCase):
         status, text = answer("temperature", sysfs=alone, unit="celsius")
         self.assertEqual((status, text), (0, "ACPI / zone 0: 0.5°C"))
 
-    def test_zero_file_is_not_a_reading_and_a_missing_sensor_is_an_error(self) -> None:
+    def test_zero_celsius_is_a_reading_and_a_missing_sensor_is_an_error(self) -> None:
         write(self.sysfs, "class/hwmon/hwmon3/temp2_input", "0\n")
         status, text = self.ask("show the acpi temperature")
-        self.assertEqual(text, "ACPI / temp1: 40.0°C")
+        self.assertEqual(status, 0)
+        self.assertEqual(text, "ACPI / temp1: 40.0°C\nACPI / temp2: 0.0°C")
+        write(self.sysfs, "class/hwmon/hwmon3/temp2_input", "-200000\n")
+        status, text = self.ask("show the acpi temperature")
+        self.assertEqual((status, text), (0, "ACPI / temp1: 40.0°C"))
+        freezing = self.sysfs / "freeze"
+        write(freezing, "class/hwmon/hwmon0/name", "acpitz\n")
+        write(freezing, "class/hwmon/hwmon0/temp1_input", "-100000\n")
+        status, text = answer("acpitz temperature", sysfs=freezing, unit="celsius")
+        self.assertEqual((status, text), (0, "ACPI / temp1: -100.0°C"))
+        write(freezing, "class/hwmon/hwmon0/temp1_input", "-100001\n")
+        status, text = answer("acpitz temperature", sysfs=freezing, unit="celsius")
+        self.assertEqual((status, text), (1, "no current temperature"))
+        write(freezing, "class/hwmon/hwmon0/temp1_input", "250001\n")
+        status, text = answer("acpitz temperature", sysfs=freezing, unit="celsius")
+        self.assertEqual((status, text), (1, "no current temperature"))
+        status, text = answer("nvme temperature", sysfs=freezing, unit="celsius")
+        self.assertEqual(status, 3)
         empty = self.sysfs / "empty"
         empty.mkdir()
         status, text = answer("how hot is it?", sysfs=empty, unit="celsius")

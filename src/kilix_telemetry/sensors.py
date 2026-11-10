@@ -14,6 +14,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 NOT_SENSOR = 3
+# A disconnected or nonsense file is outside this range. Zero and temperatures
+# below freezing are readings; the upper bound matches the previous cap.
+_MIN_CELSIUS = -100.0
+_MAX_CELSIUS = 250.0
 _CPU_NAMES = frozenset({"coretemp", "x86_pkg_temp"})
 _RESERVED = frozenset({"the", "my", "this", "a"})
 _ZONE = re.compile(r"thermal_zone\d+")
@@ -178,15 +182,23 @@ def _token(root: Path, path: Path) -> str | None:
     return text
 
 
-def _celsius(root: Path, path: Path) -> float | None:
+def _raw_celsius(root: Path, path: Path) -> float | None:
+    """Millidegree file as degrees, including values outside the accepted range.
+
+    None means the file is missing or not an integer. The kernel unit for both
+    thermal-zone and hwmon files is millidegree Celsius.
+    """
     text = _token(root, path)
     if text is None or _INTEGER.fullmatch(text) is None:
         return None
-    # The kernel unit for both files is millidegree Celsius.
     value = int(text) / 1000.0
-    if not math.isfinite(value) or value <= 0.0 or value > 250.0:
+    if not math.isfinite(value):
         return None
     return value
+
+
+def _accepted_celsius(value: float) -> bool:
+    return _MIN_CELSIUS <= value <= _MAX_CELSIUS
 
 
 def _rpm(root: Path, path: Path) -> int | None:
@@ -213,17 +225,32 @@ def _dirs(root: Path, parent: Path, pattern: re.Pattern[str]) -> list[Path]:
     return sorted(found, key=lambda child: _natural_key(child.name))
 
 
-def read_temperatures(sysfs: Path = Path("/sys")) -> tuple[Temperature, ...]:
-    """Current zone and hwmon temperatures, in discovery order."""
+def _scan_temperatures(
+    sysfs: Path,
+) -> tuple[tuple[Temperature, ...], tuple[tuple[str, str, str], ...]]:
+    """Accepted readings, and identities whose file is outside the range.
+
+    A rejected file is still that sensor. Callers that only want current
+    readings use read_temperatures.
+    """
     root = Path(sysfs)
     found: list[Temperature] = []
+    rejected: list[tuple[str, str, str]] = []
+
+    def take(raw: str, label: str, path: Path) -> None:
+        value = _raw_celsius(root, path)
+        if value is None:
+            return
+        chip = _pretty_chip(raw)
+        if not _accepted_celsius(value):
+            rejected.append((raw, chip, label))
+            return
+        found.append(Temperature(chip, raw, label, value))
+
     for zone in _dirs(root, root / "class" / "thermal", _ZONE):
-        celsius = _celsius(root, zone / "temp")
-        if celsius is None:
-            continue
         raw = _token(root, zone / "type") or zone.name
         index = zone.name.removeprefix("thermal_zone")
-        found.append(Temperature(_pretty_chip(raw), raw, f"zone {index}", celsius))
+        take(raw, f"zone {index}", zone / "temp")
     for hwmon in _dirs(root, root / "class" / "hwmon", _HWMON):
         raw = _token(root, hwmon / "name") or hwmon.name
         try:
@@ -235,15 +262,16 @@ def read_temperatures(sysfs: Path = Path("/sys")) -> tuple[Temperature, ...]:
             key=lambda item: _natural_key(item.name),
         )
         for item in inputs:
-            celsius = _celsius(root, item)
-            if celsius is None:
-                continue
             prefix = item.name.removesuffix("_input")
             label = _token(root, hwmon / f"{prefix}_label") or prefix
-            found.append(Temperature(
-                _pretty_chip(raw), raw, _clean_label(label), celsius,
-            ))
-    return tuple(found)
+            take(raw, _clean_label(label), item)
+    return tuple(found), tuple(rejected)
+
+
+def read_temperatures(sysfs: Path = Path("/sys")) -> tuple[Temperature, ...]:
+    """Current zone and hwmon temperatures, in discovery order."""
+    found, _rejected = _scan_temperatures(sysfs)
+    return found
 
 
 def read_fans(sysfs: Path = Path("/sys")) -> tuple[Fan, ...]:
@@ -313,7 +341,7 @@ def answer(
     chosen = request.unit or unit
     if chosen not in {"celsius", "fahrenheit"}:
         chosen = "fahrenheit"
-    temperatures = read_temperatures(sysfs)
+    temperatures, rejected = _scan_temperatures(sysfs)
     if request.kind == "temperature":
         selected = _hottest(temperatures)
         if not selected:
@@ -333,9 +361,13 @@ def answer(
             item for item in temperatures
             if _same(item.name, item.chip, item.label, request.name)
         )
-        if not selected:
-            return NOT_SENSOR, ""
-        return 0, "\n".join(_format_temperature(item, chosen) for item in selected)
+        if selected:
+            return 0, "\n".join(_format_temperature(item, chosen) for item in selected)
+        # The name is on a file, but that file is outside the physical range.
+        # An unknown name still continues (status 3).
+        if any(_same(name, chip, label, request.name) for name, chip, label in rejected):
+            return 1, "no current temperature"
+        return NOT_SENSOR, ""
     fans = read_fans(sysfs)
     if request.kind == "named-fan":
         fans = tuple(
