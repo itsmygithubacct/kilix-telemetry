@@ -143,8 +143,20 @@ class ConsumerLifecycleTests(unittest.TestCase):
     def test_foreign_uid_and_zombie_are_rejected(self):
         with mock.patch('kilix_telemetry.consumers.os.getuid', return_value=os.getuid() + 1):
             self.assertIsNone(process_identity(os.getpid()))
-        with mock.patch('kilix_telemetry.consumers.Path.read_text', return_value='1 (x) Z ' + '0 ' * 20):
-            self.assertIsNone(process_identity(os.getpid()))
+        if sys.platform.startswith('linux'):
+            with mock.patch('kilix_telemetry.consumers.Path.read_text', return_value='1 (x) Z ' + '0 ' * 20):
+                self.assertIsNone(process_identity(os.getpid()))
+        # A real zombie, on every host: an exited child not yet reaped.
+        zombie = os.fork()
+        if zombie == 0:
+            os._exit(0)
+        try:
+            deadline = time.monotonic() + 5
+            while process_identity(zombie) is not None and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertIsNone(process_identity(zombie))
+        finally:
+            os.waitpid(zombie, 0)
 
     def test_forked_client_registers_new_process_even_for_cached_sample(self):
         client = TelemetryClient(self.paths, fallback_root=self.root)
